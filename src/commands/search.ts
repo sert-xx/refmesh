@@ -24,6 +24,9 @@ export interface SearchOptions {
   reinforcementWeight?: number;
   includeArchived?: boolean;
   format: 'text' | 'json';
+  // Skip side effects (e.g., reinforcement accessCount increment).
+  // Used by the console dashboard to keep the API strictly read-only.
+  readOnly?: boolean;
 }
 
 export interface SearchConceptNode {
@@ -468,7 +471,7 @@ export async function executeSearch(
   const allIds = [...matchedIds, ...relatedIds];
   const references = await getReferencesForConcepts(conn, allIds);
 
-  if (matchedIds.length > 0) {
+  if (matchedIds.length > 0 && !options.readOnly) {
     await incrementAccessCounts(conn, matchedIds);
   }
 

@@ -11,6 +11,7 @@ import {
   renderPruneResult,
   renderUnarchiveResult,
 } from './commands/archive.js';
+import { runConsoleCommand } from './commands/console.js';
 import {
   executeRegister,
   parseAndValidate,
@@ -228,6 +229,30 @@ export function buildProgram(): Command {
         }
       },
     );
+
+  program
+    .command('console')
+    .description(
+      'Start a local read-only dashboard to inspect the graph DB in a browser (loopback only).',
+    )
+    .option('--port <n>', 'Port to bind (0 = auto-pick a free port)', '0')
+    .option(
+      '--host <host>',
+      'Host to bind (default 127.0.0.1; loopback enforced per-request)',
+      '127.0.0.1',
+    )
+    .option('--no-open', 'Do not open a browser automatically')
+    .action(async (opts: { port: string; host: string; open: boolean }) => {
+      try {
+        await runConsoleCommand({
+          port: Number.parseInt(opts.port, 10),
+          host: opts.host,
+          open: opts.open,
+        });
+      } catch (err) {
+        handleError(err);
+      }
+    });
 
   return program;
 }
