@@ -126,7 +126,27 @@ refmesh search "useState" --threshold 0.7 --format json      # 類似度 0.7 以
 サマリに `⚠ Similar existing concepts` として警告する。エージェントはこれを受けて、新規ノード作成を止めて
 既存 id を再利用するか、`SAME_AS` エッジで接続するか判断する。
 
-### 4. 古い知識の整理（archive / prune）
+### 4. グラフDBの状態をブラウザで確認（console）
+
+`refmesh console` でローカル Web ダッシュボードを起動し、ブラウザでグラフを視覚的に点検できる。
+**読み取り専用**で、ループバック (`127.0.0.1`) のみ受け付ける。Python 依存はゼロ。
+
+```bash
+refmesh console                # 空きポートに自動バインドし、既定ブラウザで開く
+refmesh console --port 8765    # ポートを固定
+refmesh console --no-open      # ブラウザを開かず URL だけ表示
+```
+
+ダッシュボードのタブ構成:
+
+- **Overview**: Concept / Reference / Edge 件数、Edge type 別の分布、Kùzu / LanceDB のパスとサイズ。
+- **Concepts**: 一覧 + ページング + ソート (lastSeenAt / touchCount / id)。`archived` も任意で表示。
+- **Search**: 自然言語クエリで `refmesh search` 相当のスコアリング検索を実行。
+- **Graph**: 起点 Concept を指定するとグラフを描画。**ノードクリックで近傍を増分展開**でき、Edge type ごとに色分けされる。
+
+`Ctrl+C` で停止し、Kùzu / LanceDB のコネクションをクリーンに閉じる。
+
+### 5. 古い知識の整理（archive / prune）
 
 ```bash
 # 論理アーカイブ（検索から除外、復活可能）
@@ -202,7 +222,11 @@ src/
 │   ├── types.ts           # refmesh types
 │   ├── register.ts        # refmesh register (Graph + Vector 同期 + メタデータ更新)
 │   ├── search.ts          # refmesh search (cosine × freshness × reinforcement の合成スコア)
-│   └── archive.ts         # refmesh archive / unarchive / prune
+│   ├── archive.ts         # refmesh archive / unarchive / prune
+│   └── console.ts         # refmesh console (ローカル Web ダッシュボード)
+├── console/
+│   ├── handlers.ts        # 読み取り専用 API (stats / concepts / neighbors / search)
+│   └── server.ts          # loopback 限定の HTTP サーバ + 静的アセット配信
 ├── db/
 │   ├── connection.ts      # Kùzu + LanceDB のハイブリッド接続層
 │   ├── schema.ts          # ノード/エッジテーブル DDL
