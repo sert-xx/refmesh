@@ -1,9 +1,8 @@
 name: Publish to npm
 
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [published]
 
 jobs:
   publish:
@@ -13,7 +12,10 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -27,6 +29,18 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-paraphrase-multilingual-MiniLM-L12-v2
+
+      - name: Resolve and validate version from release tag
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release tag '$TAG' is not a valid semver (expected like v1.2.3 or 1.2.3-beta.1)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: $VERSION"
 
       - name: Install dependencies
         run: npm ci
@@ -43,14 +57,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Verify package.json version matches the tag
-        run: |
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          TAG_VERSION=${GITHUB_REF_NAME#v}
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::package.json version ($PKG_VERSION) does not match git tag ($TAG_VERSION)"
-            exit 1
-          fi
+      - name: Sync package.json version to release tag
+        run: npm pkg set version="${{ steps.version.outputs.version }}"
 
       - name: Publish to npm
         run: npm publish --access public --provenance
