@@ -1,0 +1,4 @@
+interface:
+  display_name: "Refmesh Curate"
+  short_description: "Merge duplicates and retire stale concepts"
+  default_prompt: "Use $refmesh-curate to mark the old API as deprecated by the new one."

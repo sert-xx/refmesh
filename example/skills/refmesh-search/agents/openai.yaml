@@ -1,0 +1,4 @@
+interface:
+  display_name: "Refmesh Search"
+  short_description: "Recall related concepts before starting a new task"
+  default_prompt: "Use $refmesh-search to recall what we know about React state management."

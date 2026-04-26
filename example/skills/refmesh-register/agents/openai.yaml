@@ -1,0 +1,4 @@
+interface:
+  display_name: "Refmesh Register"
+  short_description: "Persist concepts and edges into the local refmesh graph"
+  default_prompt: "Use $refmesh-register to remember the document I just read."
