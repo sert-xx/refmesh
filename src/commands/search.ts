@@ -1,4 +1,5 @@
 import type { KuzuConnection, RefmeshHybridStores } from '../db/connection.js';
+import { cypherIdListLiteral } from '../db/cypher.js';
 import { embed } from '../embedding/embedder.js';
 import {
   ALL_EDGE_TYPE_NAMES,
@@ -156,20 +157,6 @@ function rowToConcept(row: Record<string, unknown>): SearchConceptNode {
   return { id, description, details };
 }
 
-async function fetchConceptById(
-  conn: KuzuConnection,
-  id: string,
-): Promise<SearchConceptNode | null> {
-  const rows = await queryAll(
-    conn,
-    `MATCH (c:Concept) WHERE c.id = $id
-     RETURN c.id AS id, c.description AS description, c.details AS details`,
-    { id },
-  );
-  const r = rows[0];
-  return r ? rowToConcept(r) : null;
-}
-
 interface ConceptFreshnessRow {
   archivedAt: Date | null;
   lastSeenAt: Date | null;
@@ -178,68 +165,102 @@ interface ConceptFreshnessRow {
   isDeprecated: boolean;
 }
 
-async function fetchConceptFreshness(
+// Bulk-load minimal concept attrs for an entire id list in one query.
+// Replaces the old per-hit fetchConceptById loop that dominated executeSearch
+// latency (PBI-13).
+async function bulkConceptsByIds(
   conn: KuzuConnection,
-  id: string,
-): Promise<ConceptFreshnessRow | null> {
-  const baseRows = await queryAll(
+  ids: readonly string[],
+): Promise<Map<string, SearchConceptNode>> {
+  const map = new Map<string, SearchConceptNode>();
+  if (ids.length === 0) return map;
+  const rows = await queryAll(
     conn,
-    `MATCH (c:Concept) WHERE c.id = $id
-     RETURN c.archivedAt AS archivedAt, c.lastSeenAt AS lastSeenAt,
-            c.accessCount AS accessCount`,
-    { id },
+    `MATCH (c:Concept) WHERE c.id IN ${cypherIdListLiteral(ids)}
+     RETURN c.id AS id, c.description AS description, c.details AS details`,
   );
-  const base = baseRows[0];
-  if (!base) return null;
-
-  const refRows = await queryAll(
-    conn,
-    `MATCH (r:Reference)-[:${INTERNAL_DESCRIBES_EDGE}]->(c:Concept)
-     WHERE c.id = $id
-     RETURN r.publishedAt AS publishedAt`,
-    { id },
-  );
-  let newestPublishedAt: Date | null = null;
-  for (const row of refRows) {
-    const v = row['publishedAt'];
-    if (v instanceof Date && (!newestPublishedAt || v.getTime() > newestPublishedAt.getTime())) {
-      newestPublishedAt = v;
-    }
+  for (const r of rows) {
+    const id = String(r['id'] ?? '');
+    map.set(id, rowToConcept(r));
   }
+  return map;
+}
 
-  let isDeprecated = false;
-  for (const edgeType of ['DEPRECATES', 'REPLACES']) {
-    const rows = await queryAll(
+// Bulk-load freshness signals (archivedAt / lastSeenAt / accessCount,
+// newest publishedAt of any attached Reference, and "is deprecated" via
+// DEPRECATES/REPLACES inbound edges) for an entire id list, using only 4
+// queries that run in parallel regardless of |ids|.
+async function bulkConceptFreshness(
+  conn: KuzuConnection,
+  ids: readonly string[],
+): Promise<Map<string, ConceptFreshnessRow>> {
+  const map = new Map<string, ConceptFreshnessRow>();
+  if (ids.length === 0) return map;
+  const inList = cypherIdListLiteral(ids);
+
+  const [baseRows, refRows, deprRows, replRows] = await Promise.all([
+    queryAll(
       conn,
-      `MATCH (other:Concept)-[e:${edgeType}]->(c:Concept)
-       WHERE c.id = $id AND other.id <> $id
-       RETURN other.id AS otherId LIMIT 1`,
-      { id },
-    );
-    if (rows.length > 0) {
-      isDeprecated = true;
-      break;
+      `MATCH (c:Concept) WHERE c.id IN ${inList}
+       RETURN c.id AS id, c.archivedAt AS archivedAt,
+              c.lastSeenAt AS lastSeenAt, c.accessCount AS accessCount`,
+    ),
+    queryAll(
+      conn,
+      `MATCH (r:Reference)-[:${INTERNAL_DESCRIBES_EDGE}]->(c:Concept)
+       WHERE c.id IN ${inList}
+       RETURN c.id AS id, r.publishedAt AS publishedAt`,
+    ),
+    queryAll(
+      conn,
+      `MATCH (other:Concept)-[:DEPRECATES]->(c:Concept)
+       WHERE c.id IN ${inList} AND other.id <> c.id
+       RETURN c.id AS id`,
+    ),
+    queryAll(
+      conn,
+      `MATCH (other:Concept)-[:REPLACES]->(c:Concept)
+       WHERE c.id IN ${inList} AND other.id <> c.id
+       RETURN c.id AS id`,
+    ),
+  ]);
+
+  const newestByConcept = new Map<string, Date>();
+  for (const row of refRows) {
+    const id = String(row['id'] ?? '');
+    const v = row['publishedAt'];
+    if (v instanceof Date) {
+      const cur = newestByConcept.get(id);
+      if (!cur || v.getTime() > cur.getTime()) {
+        newestByConcept.set(id, v);
+      }
     }
   }
 
-  return {
-    archivedAt: base['archivedAt'] instanceof Date ? (base['archivedAt'] as Date) : null,
-    lastSeenAt: base['lastSeenAt'] instanceof Date ? (base['lastSeenAt'] as Date) : null,
-    accessCount: Number(base['accessCount'] ?? 0),
-    newestPublishedAt,
-    isDeprecated,
-  };
+  const deprecated = new Set<string>();
+  for (const row of deprRows) deprecated.add(String(row['id'] ?? ''));
+  for (const row of replRows) deprecated.add(String(row['id'] ?? ''));
+
+  for (const row of baseRows) {
+    const id = String(row['id'] ?? '');
+    map.set(id, {
+      archivedAt: row['archivedAt'] instanceof Date ? (row['archivedAt'] as Date) : null,
+      lastSeenAt: row['lastSeenAt'] instanceof Date ? (row['lastSeenAt'] as Date) : null,
+      accessCount: Number(row['accessCount'] ?? 0),
+      newestPublishedAt: newestByConcept.get(id) ?? null,
+      isDeprecated: deprecated.has(id),
+    });
+  }
+  return map;
 }
 
 async function incrementAccessCounts(conn: KuzuConnection, ids: string[]): Promise<void> {
-  for (const id of ids) {
-    await queryAll(
-      conn,
-      `MATCH (c:Concept) WHERE c.id = $id
-       SET c.accessCount = c.accessCount + 1`,
-      { id },
-    );
-  }
+  if (ids.length === 0) return;
+  await queryAll(
+    conn,
+    `MATCH (c:Concept) WHERE c.id IN ${cypherIdListLiteral(ids)}
+     SET c.accessCount = c.accessCount + 1`,
+  );
 }
 
 function ageInDays(now: Date, anchor: Date | null): number {
@@ -253,22 +274,27 @@ function freshnessScore(ageDays: number, halfLifeDays: number): number {
   return Math.exp(-Math.LN2 * (ageDays / halfLifeDays));
 }
 
-async function getConceptsByIds(conn: KuzuConnection, ids: string[]): Promise<SearchConceptNode[]> {
+// Single-query out+in edge fetch for a frontier slice. Replaces the inner
+// 2 × |frontier| × |edge_types| loop with one query per edge type.
+async function bulkEdgesForFrontier(
+  conn: KuzuConnection,
+  edgeType: string,
+  ids: readonly string[],
+): Promise<SearchEdge[]> {
   if (ids.length === 0) return [];
-  const result: SearchConceptNode[] = [];
-  for (const id of ids) {
-    const rows = await queryAll(
-      conn,
-      `MATCH (c:Concept) WHERE c.id = $id
-       RETURN c.id AS id, c.description AS description, c.details AS details`,
-      { id },
-    );
-    if (rows.length > 0) {
-      const r = rows[0];
-      if (r) result.push(rowToConcept(r));
-    }
-  }
-  return result;
+  const inList = cypherIdListLiteral(ids);
+  const rows = await queryAll(
+    conn,
+    `MATCH (a:Concept)-[e:${edgeType}]->(b:Concept)
+     WHERE a.id IN ${inList} OR b.id IN ${inList}
+     RETURN a.id AS source, b.id AS target, e.reason AS reason`,
+  );
+  return rows.map((row) => ({
+    source: String(row['source']),
+    target: String(row['target']),
+    type: edgeType,
+    reason: row['reason'] == null ? undefined : String(row['reason']),
+  }));
 }
 
 async function collectRelatedEdges(
@@ -282,56 +308,31 @@ async function collectRelatedEdges(
     return { edges, reachedIds: reached };
   }
 
-  let frontier = new Set<string>(rootIds);
+  let frontier: string[] = [...rootIds];
   for (let level = 0; level < depth; level += 1) {
-    const nextFrontier = new Set<string>();
-    for (const id of frontier) {
-      for (const edgeType of PUBLIC_EDGE_TYPE_NAMES) {
-        const outgoing = await queryAll(
-          conn,
-          `MATCH (a:Concept)-[e:${edgeType}]->(b:Concept)
-           WHERE a.id = $id
-           RETURN a.id AS source, b.id AS target, e.reason AS reason`,
-          { id },
-        );
-        for (const row of outgoing) {
-          const edge: SearchEdge = {
-            source: String(row['source']),
-            target: String(row['target']),
-            type: edgeType,
-            reason: row['reason'] == null ? undefined : String(row['reason']),
-          };
-          edges.push(edge);
-          if (!reached.has(edge.target)) {
-            reached.add(edge.target);
-            nextFrontier.add(edge.target);
-          }
-        }
+    if (frontier.length === 0) break;
 
-        const incoming = await queryAll(
-          conn,
-          `MATCH (a:Concept)-[e:${edgeType}]->(b:Concept)
-           WHERE b.id = $id
-           RETURN a.id AS source, b.id AS target, e.reason AS reason`,
-          { id },
-        );
-        for (const row of incoming) {
-          const edge: SearchEdge = {
-            source: String(row['source']),
-            target: String(row['target']),
-            type: edgeType,
-            reason: row['reason'] == null ? undefined : String(row['reason']),
-          };
-          edges.push(edge);
-          if (!reached.has(edge.source)) {
-            reached.add(edge.source);
-            nextFrontier.add(edge.source);
-          }
+    // |edge_types| queries (parallel) for the entire frontier, instead of
+    // |frontier| × |edge_types| × 2-direction sequential.
+    const batches = await Promise.all(
+      PUBLIC_EDGE_TYPE_NAMES.map((edgeType) => bulkEdgesForFrontier(conn, edgeType, frontier)),
+    );
+
+    const nextFrontier = new Set<string>();
+    for (const batch of batches) {
+      for (const edge of batch) {
+        edges.push(edge);
+        if (!reached.has(edge.target)) {
+          reached.add(edge.target);
+          nextFrontier.add(edge.target);
+        }
+        if (!reached.has(edge.source)) {
+          reached.add(edge.source);
+          nextFrontier.add(edge.source);
         }
       }
     }
-    frontier = nextFrontier;
-    if (frontier.size === 0) break;
+    frontier = [...nextFrontier];
   }
 
   const dedup = new Map<string, SearchEdge>();
@@ -347,20 +348,17 @@ async function getReferencesForConcepts(
   ids: string[],
 ): Promise<SearchReferenceNode[]> {
   if (ids.length === 0) return [];
+  const rows = await queryAll(
+    conn,
+    `MATCH (r:Reference)-[:${INTERNAL_DESCRIBES_EDGE}]->(c:Concept)
+     WHERE c.id IN ${cypherIdListLiteral(ids)}
+     RETURN r.url AS url, r.title AS title`,
+  );
   const seen = new Map<string, SearchReferenceNode>();
-  for (const id of ids) {
-    const rows = await queryAll(
-      conn,
-      `MATCH (r:Reference)-[:${INTERNAL_DESCRIBES_EDGE}]->(c:Concept)
-       WHERE c.id = $id
-       RETURN r.url AS url, r.title AS title`,
-      { id },
-    );
-    for (const row of rows) {
-      const url = String(row['url']);
-      if (!seen.has(url)) {
-        seen.set(url, { url, title: String(row['title']) });
-      }
+  for (const row of rows) {
+    const url = String(row['url']);
+    if (!seen.has(url)) {
+      seen.set(url, { url, title: String(row['title']) });
     }
   }
   return [...seen.values()];
@@ -400,11 +398,18 @@ export async function executeSearch(
     rawFreshness: number;
     rawAccess: number;
   }
+  // One bulk fetch + one bulk freshness call covers every vector hit, instead
+  // of N individual round-trips (PBI-13).
+  const hitIds = hits.map((h) => h.id);
+  const [conceptMap, freshnessMap] = await Promise.all([
+    bulkConceptsByIds(conn, hitIds),
+    bulkConceptFreshness(conn, hitIds),
+  ]);
   const partials: PartialCandidate[] = [];
   for (const hit of hits) {
-    const concept = await fetchConceptById(conn, hit.id);
+    const concept = conceptMap.get(hit.id);
     if (!concept) continue;
-    const fresh = await fetchConceptFreshness(conn, hit.id);
+    const fresh = freshnessMap.get(hit.id);
     if (!fresh) continue;
     if (!includeArchived && fresh.archivedAt) continue;
 
@@ -459,14 +464,22 @@ export async function executeSearch(
   const { edges, reachedIds } = await collectRelatedEdges(conn, matchedIds, options.depth);
   let relatedIds = [...reachedIds].filter((id) => !matchedIds.includes(id));
   if (!includeArchived && relatedIds.length > 0) {
-    const filteredRelated: string[] = [];
-    for (const id of relatedIds) {
-      const fresh = await fetchConceptFreshness(conn, id);
-      if (fresh && !fresh.archivedAt) filteredRelated.push(id);
-    }
-    relatedIds = filteredRelated;
+    // We only need the archived bit here, not the full freshness payload —
+    // a single MATCH avoids 4 unrelated queries that bulkConceptFreshness
+    // would have run for newest publishedAt / DEPRECATES / REPLACES.
+    const visibleRows = await queryAll(
+      conn,
+      `MATCH (c:Concept) WHERE c.id IN ${cypherIdListLiteral(relatedIds)}
+         AND c.archivedAt IS NULL
+       RETURN c.id AS id`,
+    );
+    const visible = new Set(visibleRows.map((r) => String(r['id'] ?? '')));
+    relatedIds = relatedIds.filter((id) => visible.has(id));
   }
-  const relatedConcepts = await getConceptsByIds(conn, relatedIds);
+  const relatedConceptMap = await bulkConceptsByIds(conn, relatedIds);
+  const relatedConcepts: SearchConceptNode[] = relatedIds
+    .map((id) => relatedConceptMap.get(id))
+    .filter((c): c is SearchConceptNode => c !== undefined);
 
   const allIds = [...matchedIds, ...relatedIds];
   const references = await getReferencesForConcepts(conn, allIds);

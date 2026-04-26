@@ -3,6 +3,7 @@ import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { type SearchOptions, type SearchResult, executeSearch } from '../commands/search.js';
 import type { KuzuConnection, RefmeshHybridStores } from '../db/connection.js';
+import { cypherIdListLiteral } from '../db/cypher.js';
 import {
   ALL_EDGE_TYPE_NAMES,
   INTERNAL_DESCRIBES_EDGE,
@@ -343,20 +344,6 @@ interface MinimalConceptRow {
   description: string;
   details: string | null;
   archived: boolean;
-}
-
-// Kùzu's prepared statements only accept boolean / number / string / Date /
-// BigInt parameters, so list-valued bindings (`$ids`) are not available. To
-// avoid an N+1 explosion in getNeighbors we splice ids into a Cypher list
-// literal directly and rely on a strict escape that double-encodes both
-// backslashes and single quotes (matching Kùzu's string-literal grammar).
-function escapeCypherString(value: string): string {
-  return value.replaceAll('\\', '\\\\').replaceAll("'", "\\'");
-}
-
-function cypherIdListLiteral(ids: readonly string[]): string {
-  if (ids.length === 0) return '[]';
-  return `[${ids.map((id) => `'${escapeCypherString(id)}'`).join(', ')}]`;
 }
 
 async function bulkMinimalConcepts(
