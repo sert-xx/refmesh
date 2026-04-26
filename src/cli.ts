@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
@@ -238,9 +238,15 @@ export async function main(argv: string[] = process.argv): Promise<void> {
 }
 
 // Allow: (a) direct execution as `node dist/cli.js` and (b) npm bin invocation.
+// `npm install -g` exposes `refmesh` as a symlink, so process.argv[1] points at
+// the symlink path while import.meta.url resolves to the real file. Resolve both
+// through realpath before comparing to avoid a silent no-op when run via the bin.
 const invokedDirectly = (() => {
   try {
-    return process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+    if (!process.argv[1]) return false;
+    const resolvedArgv = realpathSync(process.argv[1]);
+    const resolvedSelf = fileURLToPath(import.meta.url);
+    return resolvedArgv === resolvedSelf;
   } catch {
     return false;
   }
