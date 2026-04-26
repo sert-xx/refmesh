@@ -12,22 +12,31 @@
 
 ## インストール
 
-> Apple Silicon Mac では **arm64 の Node.js** が必須（LanceDB のネイティブバイナリが arm64 のみ配布）。
-> 本リポジトリには `mise.toml` を同梱しているため、`mise install` で適切な Node を自動取得できる。
+### 利用者向け（CLI として使う）
+
+npm から直接グローバルインストールする:
 
 ```bash
-mise install   # 推奨: Node.js 22 (arm64) を自動取得
-npm install
-npm run build
-# 開発時
-npm run dev -- types
+npm install -g refmesh
+refmesh --help
+refmesh types          # 動作確認
 ```
 
-グローバルで使う場合:
+> [!IMPORTANT]
+> **macOS は arm64 の Node.js が必須**。LanceDB のネイティブバイナリが darwin-arm64 のみ配布されているため、x64 の Node（Volta の旧版など）では `MODULE_NOT_FOUND` で起動できない。
+> Apple Silicon 機なら `mise` / `fnm` / `nvm` 等で arm64 Node を入れて使うこと。Linux x64 / arm64 と Windows x64 はそのまま動作する。
+>
+> 初回 `refmesh search` 実行時に Hugging Face Hub から多言語埋め込みモデル（約 80 MB）を `~/.cache/huggingface/` に取得する。以降はオフライン動作。
+
+### 開発者向け（このリポジトリで作業する）
 
 ```bash
-npm link
-refmesh --help
+mise install      # mise.toml にピンされた Node.js 22 (arm64) を取得
+npm install
+npm run build
+npm run dev -- types          # tsx で直接実行
+# あるいはローカルビルドをグローバルに公開
+npm link && refmesh --help
 ```
 
 ## 使い方
@@ -131,6 +140,34 @@ refmesh prune --older-than 365 --max-touches 1 --apply
 
 `prune` は `lastSeenAt` が cutoff より古く `touchCount <= --max-touches` のノードを Graph と Vector の両方から削除する。
 デフォルトで archived は対象外（`--include-archived` で含める）。`--apply` を付けない限り変更は加わらない。
+
+## エージェントから自動運用する（スキル同梱）
+
+`example/skills/` に **Claude Code と OpenAI Codex CLI 両対応**のスキルを 3 つ同梱している。
+シーン別にトリガーが分かれており、フォルダごと `~/.claude/skills/` または `~/.codex/skills/` にコピーするだけで利用できる。
+
+| スキル | 起動シーン | 中身 |
+|---|---|---|
+| `refmesh-register` | 「この URL を分析して知識を蓄えて」「remember this doc」 | URL を fetch → 概念抽出 → 既存グラフを `refmesh search` で discovery → 既存ノードに edge で接続して `refmesh register` |
+| `refmesh-search` | タスク開始時、固有名詞・目的が登場した瞬間 | 自然言語クエリで意味検索 + マルチ起点 BFS。鮮度・demote・reinforcement 等の状況別フラグ表を提供 |
+| `refmesh-curate` | `⚠ Similar existing concepts` 警告、世代交代、古い情報の整理 | SAME_AS マージ / REPLACES / DEPRECATES / archive / prune の判断ツリー |
+
+各スキルは `SKILL.md`（Claude / Codex 共通）と `agents/openai.yaml`（Codex の UI メタデータ）の組み合わせ。
+
+### 取り込み方法
+
+```bash
+# Claude Code（プロジェクト固有）
+mkdir -p .claude/skills && cp -r example/skills/refmesh-* .claude/skills/
+
+# Claude Code（ユーザー全体）
+mkdir -p ~/.claude/skills && cp -r example/skills/refmesh-* ~/.claude/skills/
+
+# OpenAI Codex CLI
+mkdir -p ~/.codex/skills && cp -r example/skills/refmesh-* ~/.codex/skills/
+```
+
+取り込み後、エージェントに「この URL を読んで知識を蓄えて」「先ほど登録した React Hooks について教えて」のように話しかけると、`description` のトリガーキーワードに反応して該当スキルが呼び出され、内部で `refmesh` CLI が実行される。
 
 ## データ格納先
 
