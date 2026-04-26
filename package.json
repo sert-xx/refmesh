@@ -32,6 +32,14 @@
     "memory",
     "rag"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sert-xx/refmesh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sert-xx/refmesh/issues"
+  },
+  "homepage": "https://github.com/sert-xx/refmesh#readme",
   "license": "MIT",
   "engines": {
     "node": ">=20.0.0"
