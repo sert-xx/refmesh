@@ -1,0 +1,53 @@
+{
+  "name": "refmesh",
+  "version": "0.1.0",
+  "description": "Knowledge graph construction CLI for autonomous coding agents, backed by Kùzu local graph database.",
+  "type": "module",
+  "bin": {
+    "refmesh": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check src test",
+    "lint:fix": "biome check --write src test",
+    "format": "biome format --write src test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "knowledge-graph",
+    "kuzu",
+    "cli",
+    "agent",
+    "memory",
+    "rag"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.27.2",
+    "@xenova/transformers": "^2.17.2",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "commander": "^12.1.0",
+    "kuzu": "^0.6.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.5"
+  }
+}
