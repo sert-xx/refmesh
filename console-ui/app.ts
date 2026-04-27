@@ -76,6 +76,7 @@ interface SearchHit {
   reinforcement?: number;
   accessCount?: number;
   demoted?: boolean;
+  lexical?: number;
 }
 
 interface SearchResult {
@@ -107,6 +108,7 @@ interface SearchTraceCandidate {
   ageDays: number | null;
   accessCount: number;
   reinforcement: number;
+  lexical: number;
   demoted: boolean;
   archived: boolean;
   finalScore: number;
@@ -121,6 +123,7 @@ interface SearchTraceLevel {
 
 interface SearchTrace {
   queryEmbedding: { dim: number; l2Norm: number; preview: number[]; full: number[] };
+  queryTokens: string[];
   vectorRequest: { limit: number; oversample: number; threshold: number };
   vectorHits: SearchTraceVectorHit[];
   graphQueries: SearchTraceGraphQuery[];
@@ -565,6 +568,7 @@ async function runSearchDebug(event?: Event): Promise<void> {
     ['maxAgeDays', '#search-debug-max-age'],
     ['demoteDeprecated', '#search-debug-demote'],
     ['reinforcementWeight', '#search-debug-reinforcement-weight'],
+    ['lexicalWeight', '#search-debug-lexical-weight'],
   ];
   for (const [key, selector] of optionalParams) {
     const v = readOptionalNumberValue(selector);
@@ -610,6 +614,14 @@ function renderSearchDebug(target: HTMLElement, data: SearchDebugResponse): void
           .map((v) => v.toFixed(6))
           .join(', ')}]</pre>
       </details>
+      <div class="debug-meta" style="margin-top:6px;">
+        query tokens (lexical scorer 用):
+        ${
+          trace.queryTokens.length === 0
+            ? '<em>(none)</em>'
+            : trace.queryTokens.map((t) => `<code>${escapeHtml(t)}</code>`).join(' ')
+        }
+      </div>
     </section>
 
     <section class="debug-section">
@@ -692,6 +704,7 @@ function renderSearchDebug(target: HTMLElement, data: SearchDebugResponse): void
               <th>age (d)</th>
               <th>access</th>
               <th>reinf</th>
+              <th>lexical</th>
               <th>flags</th>
               <th>final</th>
               <th>status</th>
@@ -716,6 +729,7 @@ function renderSearchDebug(target: HTMLElement, data: SearchDebugResponse): void
                     <td>${c.ageDays === null ? '—' : c.ageDays.toFixed(1)}</td>
                     <td>${c.accessCount}</td>
                     <td>${c.reinforcement.toFixed(4)}</td>
+                    <td>${c.lexical.toFixed(4)}</td>
                     <td>${flags}</td>
                     <td>${c.finalScore.toFixed(4)}</td>
                     <td>${status}</td>
