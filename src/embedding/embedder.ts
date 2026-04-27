@@ -1,8 +1,21 @@
-import { pipeline } from '@xenova/transformers';
+import { mkdir } from 'node:fs/promises';
+import { env, pipeline } from '@xenova/transformers';
 import { RefmeshRuntimeError } from '../util/errors.js';
+import { resolveModelDir } from './paths.js';
 
 export const EMBEDDING_MODEL_ID = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
 export const EMBEDDING_DIMENSION = 384;
+
+// Point @xenova/transformers' filesystem cache at refmesh's managed directory
+// so cached weights live under ~/.refmesh/models/ (or REFMESH_MODEL_DIR) instead
+// of the package-relative default. Resolving lazily lets tests override the
+// REFMESH_MODEL_DIR env var without having to reload the module.
+async function applyModelCacheDir(): Promise<string> {
+  const modelDir = resolveModelDir();
+  env.cacheDir = modelDir;
+  await mkdir(modelDir, { recursive: true });
+  return modelDir;
+}
 
 type FeatureExtractor = (
   text: string | string[],
@@ -47,6 +60,10 @@ export interface DownloadReporter {
   // miss) are being fetched before the big model file produces partial
   // progress events.
   announceIfStillLoading(): void;
+  // True iff a real download (partial-progress event or grace-timer fallback)
+  // happened during this reporter's lifetime. Used by `refmesh prefetch` to
+  // tell the caller whether the cache was already populated.
+  wasDownloaded(): boolean;
 }
 
 // Build a stderr-only reporter. We deliberately keep stdout untouched so
@@ -83,6 +100,9 @@ export function createStderrDownloadReporter(
   return {
     announceIfStillLoading() {
       announce();
+    },
+    wasDownloaded() {
+      return announced;
     },
     onEvent(event) {
       if (event.status === 'progress') {
@@ -127,6 +147,7 @@ async function loadExtractor(): Promise<FeatureExtractor> {
   if (loadPromise) return loadPromise;
 
   loadPromise = (async () => {
+    await applyModelCacheDir();
     const reporter = createStderrDownloadReporter();
     const graceTimer = setTimeout(() => reporter.announceIfStillLoading(), LOAD_GRACE_MS);
     try {
@@ -148,6 +169,41 @@ async function loadExtractor(): Promise<FeatureExtractor> {
     }
   })();
   return loadPromise;
+}
+
+export interface PrefetchResult {
+  modelId: string;
+  modelDir: string;
+  downloaded: boolean;
+}
+
+// Eagerly populate the FS cache for the embedding model so subsequent invocations
+// (including those running under read-only HOME / sandboxed agents) can load the
+// model without any network access or writes to a foreign cache directory.
+//
+// Idempotent: if every required file is already on disk, `pipeline()` returns
+// without ever hitting the remote host and `wasDownloaded()` stays false.
+export async function prefetchEmbeddingModel(): Promise<PrefetchResult> {
+  const modelDir = await applyModelCacheDir();
+  const reporter = createStderrDownloadReporter();
+  const graceTimer = setTimeout(() => reporter.announceIfStillLoading(), LOAD_GRACE_MS);
+  try {
+    await pipeline('feature-extraction', EMBEDDING_MODEL_ID, {
+      progress_callback: (event: ProgressEvent) => reporter.onEvent(event),
+    });
+    return {
+      modelId: EMBEDDING_MODEL_ID,
+      modelDir,
+      downloaded: reporter.wasDownloaded(),
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new RefmeshRuntimeError(
+      `Failed to prefetch embedding model ${EMBEDDING_MODEL_ID}: ${msg}`,
+    );
+  } finally {
+    clearTimeout(graceTimer);
+  }
 }
 
 export async function embed(text: string): Promise<number[]> {

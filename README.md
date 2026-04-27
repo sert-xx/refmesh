@@ -29,7 +29,9 @@ refmesh types          # 動作確認
 >
 > `better-sqlite3` はネイティブビルドが必要ですが、メジャー OS / Node.js バージョン向けにプリビルトが配布されているため通常は `npm install` だけで完了します。
 >
-> 初回 `refmesh search` 実行時に Hugging Face Hub から多言語埋め込みモデル（約 80 MB）を `~/.cache/huggingface/` に取得する。以降はオフライン動作。
+> 初回 `refmesh search` 実行時に Hugging Face Hub から多言語埋め込みモデル（約 80 MB）を `~/.refmesh/models/` に取得する。以降はオフライン動作。
+>
+> **書き込み権限が制限された環境（Codex 等のサンドボックス CLI）から refmesh を呼び出す場合**、当該環境では `~/.refmesh/models/` への書き込みに失敗してモデル読み込みが詰まる。事前に書き込み権限のあるユーザで `refmesh prefetch` を実行してモデルを配置しておけば、以降の `refmesh search` / `register` は読み取りのみで動作する。配置先を変更したい場合は環境変数 `REFMESH_MODEL_DIR` で上書きできる（事前 DL とランタイムの双方で同じ値を渡すこと）。
 
 ### 開発者向け（このリポジトリで作業する）
 
@@ -198,8 +200,17 @@ mkdir -p ~/.codex/skills && cp -r example/skills/refmesh-* ~/.codex/skills/
 
 ## データ格納先
 
-- Graph (Kùzu) デフォルト: `~/.refmesh/graph.kuzu` / 上書き: `REFMESH_DB_PATH`
-- Vector (LanceDB) デフォルト: `~/.refmesh/vectors.lance` / 上書き: `REFMESH_VECTOR_PATH`
+- DB (SQLite) デフォルト: `~/.refmesh/refmesh.db` / 上書き: `REFMESH_DB_PATH`
+- 埋め込みモデルキャッシュ デフォルト: `~/.refmesh/models/` / 上書き: `REFMESH_MODEL_DIR`
+
+埋め込みモデルキャッシュは初回 `refmesh search` / `register` 実行時に自動で作られるが、
+`refmesh prefetch` で明示的に事前 DL することもできる（権限制限された実行環境向け）。
+
+```bash
+refmesh prefetch                      # ~/.refmesh/models/ に配置（既配置ならスキップ）
+refmesh prefetch --format json        # 機械可読出力
+REFMESH_MODEL_DIR=/opt/refmesh/models refmesh prefetch   # 配置先を上書き
+```
 
 ## エッジ種別
 
@@ -230,7 +241,8 @@ src/
 │   ├── register.ts        # refmesh register (Graph + Vector 同期 + メタデータ更新)
 │   ├── search.ts          # refmesh search (cosine × freshness × reinforcement の合成スコア)
 │   ├── archive.ts         # refmesh archive / unarchive / prune
-│   └── console.ts         # refmesh console (ローカル Web ダッシュボード)
+│   ├── console.ts         # refmesh console (ローカル Web ダッシュボード)
+│   └── prefetch.ts        # refmesh prefetch (埋め込みモデルの事前 DL / 配置)
 ├── console/
 │   ├── handlers.ts        # 読み取り専用 API (stats / concepts / neighbors / search)
 │   └── server.ts          # loopback 限定の HTTP サーバ + 静的アセット配信
@@ -240,7 +252,8 @@ src/
 │   ├── vector-store.ts    # LanceDB ラッパ (upsert/query/delete/clear)
 │   └── paths.ts           # DB パス解決
 ├── embedding/
-│   └── embedder.ts        # @xenova/transformers で埋め込み生成
+│   ├── embedder.ts        # @xenova/transformers で埋め込み生成 / prefetchEmbeddingModel()
+│   └── paths.ts           # モデルキャッシュパス解決 (~/.refmesh/models/, REFMESH_MODEL_DIR)
 ├── schema/
 │   ├── edge-types.ts      # エッジ Enum と説明 (単一ソース)
 │   └── register-schema.ts # JSON Schema (Ajv 用)

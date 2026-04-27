@@ -12,6 +12,7 @@ import {
   renderUnarchiveResult,
 } from './commands/archive.js';
 import { runConsoleCommand } from './commands/console.js';
+import { executePrefetch, renderPrefetchJson, renderPrefetchText } from './commands/prefetch.js';
 import {
   executeRegister,
   parseAndValidate,
@@ -242,6 +243,23 @@ export function buildProgram(): Command {
         }
       },
     );
+
+  program
+    .command('prefetch')
+    .description(
+      "Download the embedding model into refmesh's managed cache (~/.refmesh/models/ by default; override with REFMESH_MODEL_DIR). Idempotent: skips download when already cached.",
+    )
+    .option('--format <format>', 'Output format: text | json', 'text')
+    .action(async (opts: { format: string }) => {
+      try {
+        const format = opts.format === 'json' ? 'json' : 'text';
+        const result = await executePrefetch();
+        const output = format === 'json' ? renderPrefetchJson(result) : renderPrefetchText(result);
+        process.stdout.write(`${output}\n`);
+      } catch (err) {
+        handleError(err);
+      }
+    });
 
   program
     .command('console')
