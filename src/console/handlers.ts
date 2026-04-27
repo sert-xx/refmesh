@@ -1,7 +1,13 @@
 import { statSync } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import { type SearchOptions, type SearchResult, executeSearch } from '../commands/search.js';
+import {
+  type SearchOptions,
+  type SearchResult,
+  type SearchTrace,
+  executeSearch,
+  executeSearchWithTrace,
+} from '../commands/search.js';
 import type { KuzuConnection, RefmeshHybridStores } from '../db/connection.js';
 import { cypherIdListLiteral } from '../db/cypher.js';
 import {
@@ -493,9 +499,41 @@ export interface ConsoleSearchOptions {
   depth: number;
   threshold: number;
   includeArchived: boolean;
+  freshnessWeight?: number;
+  halfLifeDays?: number;
+  maxAgeDays?: number;
+  demoteDeprecated?: number;
+  reinforcementWeight?: number;
 }
 
 export const DEFAULT_CONSOLE_SEARCH_LIMIT = 10;
+
+function parseOptionalUnitFloat(query: URLSearchParams, key: string): number | undefined {
+  const raw = query.get(key);
+  if (raw === null) return undefined;
+  const v = Number.parseFloat(raw);
+  if (!Number.isFinite(v) || v < 0 || v > 1) {
+    throw new RefmeshValidationError(`${key} must be a number in [0, 1] (got: ${raw}).`);
+  }
+  return v;
+}
+
+function parseOptionalPositiveFloat(
+  query: URLSearchParams,
+  key: string,
+  options: { allowZero?: boolean } = {},
+): number | undefined {
+  const raw = query.get(key);
+  if (raw === null) return undefined;
+  const v = Number.parseFloat(raw);
+  const allowZero = options.allowZero ?? false;
+  const lowerOk = allowZero ? v >= 0 : v > 0;
+  if (!Number.isFinite(v) || !lowerOk) {
+    const bound = allowZero ? 'non-negative' : 'positive';
+    throw new RefmeshValidationError(`${key} must be a ${bound} number (got: ${raw}).`);
+  }
+  return v;
+}
 
 export function parseConsoleSearchOptions(query: URLSearchParams): ConsoleSearchOptions {
   const q = (query.get('q') ?? '').trim();
@@ -539,9 +577,30 @@ export function parseConsoleSearchOptions(query: URLSearchParams): ConsoleSearch
   }
 
   const includeArchived = includeArchivedRaw === 'true' || includeArchivedRaw === '1';
-  return { query: q, limit, depth, threshold, includeArchived };
+  const freshnessWeight = parseOptionalUnitFloat(query, 'freshnessWeight');
+  const halfLifeDays = parseOptionalPositiveFloat(query, 'halfLifeDays');
+  const maxAgeDays = parseOptionalPositiveFloat(query, 'maxAgeDays', { allowZero: true });
+  const demoteDeprecated = parseOptionalUnitFloat(query, 'demoteDeprecated');
+  const reinforcementWeight = parseOptionalUnitFloat(query, 'reinforcementWeight');
+
+  return {
+    query: q,
+    limit,
+    depth,
+    threshold,
+    includeArchived,
+    freshnessWeight,
+    halfLifeDays,
+    maxAgeDays,
+    demoteDeprecated,
+    reinforcementWeight,
+  };
 }
 
+// /api/search keeps its pre-PBI-16 contract: only the historical knobs
+// (q / limit / depth / threshold / includeArchived) are honored, even if a
+// caller adds the newer scoring params to the URL. This preserves the
+// "/api/search 挙動も payload も変更しない" guarantee.
 export async function runConsoleSearch(
   stores: RefmeshHybridStores,
   options: ConsoleSearchOptions,
@@ -555,4 +614,31 @@ export async function runConsoleSearch(
     readOnly: true,
   };
   return await executeSearch(stores, options.query, searchOptions);
+}
+
+export interface ConsoleSearchDebugResponse {
+  result: SearchResult;
+  trace: SearchTrace;
+}
+
+// /api/search/debug accepts the full scoring matrix so users can iterate on
+// freshness / reinforcement / demote weights without leaving the dashboard.
+export async function runConsoleSearchDebug(
+  stores: RefmeshHybridStores,
+  options: ConsoleSearchOptions,
+): Promise<ConsoleSearchDebugResponse> {
+  const searchOptions: SearchOptions = {
+    depth: options.depth,
+    limit: options.limit,
+    threshold: options.threshold,
+    includeArchived: options.includeArchived,
+    freshnessWeight: options.freshnessWeight,
+    halfLifeDays: options.halfLifeDays,
+    maxAgeDays: options.maxAgeDays,
+    demoteDeprecated: options.demoteDeprecated,
+    reinforcementWeight: options.reinforcementWeight,
+    format: 'json',
+    readOnly: true,
+  };
+  return await executeSearchWithTrace(stores, options.query, searchOptions);
 }
