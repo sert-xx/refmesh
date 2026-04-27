@@ -42,11 +42,16 @@ Read back the `edgeTypes` array and the `registerInputSchema`. **Never invent ed
 
 ## Authoring rules
 
-1. **Canonical ids.** Use the official, public name as `Concept.id` (`useState`, not `useStateHook` or `the useState hook`). This makes future agents reach the same node.
-2. **One sentence description, code in details.** `description` is what the embedder sees most strongly — keep it specific and self-contained. Put runnable snippets, signatures, or long quotes in `details`.
-3. **Build a mesh, not a list.** Every concept must connect to at least one other concept via a relationship if such a connection exists in the source. Isolated nodes are nearly useless to retrieve.
-4. **Reuse existing nodes (see "Connect to existing knowledge" below).** Always probe the graph before inventing a new id; reuse the canonical one whenever it already exists.
-5. **Date the source.** Set `reference.publishedAt` to the document's published date if known (ISO 8601). This unlocks freshness scoring later.
+1. **Extract the subject matter, not the document.** A `Concept` represents a *thing the source talks about* (an API, an algorithm, a protocol, a design pattern, a system component) — **not the source itself**. The document/page/article is captured by `reference` (url, title, publishedAt); never duplicate it as a `Concept`. Ask "what would a future reader search for?" — they will search for `useEffect`, not for "the React useEffect documentation page".
+   - ❌ Bad: `{ "id": "useEffect docs", "description": "This page explains the useEffect hook." }` — describes the document.
+   - ✅ Good: `{ "id": "useEffect", "description": "React Hook that synchronizes a function component with an external system." }` — describes the subject.
+   - If a source genuinely *is* the artifact worth remembering (e.g. a specific RFC that is itself referenced by name like "RFC 7519"), the canonical id is the artifact's name (`RFC 7519`, `JWT`), not a meta-label like "RFC 7519 specification document".
+2. **Descriptions state facts about the subject, not about the source.** Write `description` as if defining the concept in a glossary. Avoid phrases like "This document describes…", "The article explains…", "This page covers…" — they are signals you are describing the source instead of the subject.
+3. **Canonical ids.** Use the official, public name as `Concept.id` (`useState`, not `useStateHook` or `the useState hook`). This makes future agents reach the same node.
+4. **One sentence description, code in details.** `description` is what the embedder sees most strongly — keep it specific and self-contained. Put runnable snippets, signatures, or long quotes in `details`.
+5. **Build a mesh, not a list.** Every concept must connect to at least one other concept via a relationship if such a connection exists in the source. Isolated nodes are nearly useless to retrieve.
+6. **Reuse existing nodes (see "Connect to existing knowledge" below).** Always probe the graph before inventing a new id; reuse the canonical one whenever it already exists.
+7. **Date the source.** Set `reference.publishedAt` to the document's published date if known (ISO 8601). This unlocks freshness scoring later.
 
 ## Connect to existing knowledge
 
@@ -85,7 +90,7 @@ Brand-new concepts are useful, but the real value of refmesh is the **edges** be
 
 1. **Fetch** the source if only a URL was given (Step 0).
 2. **Read the whole source** before extracting. Do not extract incrementally — you will miss cross-references.
-3. **List candidate concepts** (3–15 per source is typical). Drop anything that is just an example, a typo, or already covered by an existing concept.
+3. **List candidate concepts** (3–15 per source is typical). Extract the *subjects the source talks about* — APIs, components, algorithms, protocols, patterns — **not the source itself**. If your candidate list contains an entry like "this article", "the documentation", or "<title> page", strike it: that belongs in `reference`, not `concepts[]`. Drop anything that is just an example, a typo, or already covered by an existing concept.
 4. **Run the discovery loop in [Connect to existing knowledge](#connect-to-existing-knowledge)** to find which candidates are already in the graph and which existing nodes the new ones should link to.
 5. **For every ordered pair** (new ↔ new, and new ↔ existing), ask "is there a labelled relationship from the schema that holds in the source?" If yes, record it with a one-sentence `reason`. Edges to existing nodes are just as valuable as edges between new nodes — they are what turns the graph into a *mesh*.
 6. **Write the JSON payload** to a temp file. The example below registers a *new* concept (`useEffect`) and links it to two ids: one new (`Side Effects`) and one already-known (`React Hooks`, present in the graph from a prior session, **not** repeated in `concepts[]`):
@@ -149,6 +154,7 @@ Brand-new concepts are useful, but the real value of refmesh is the **edges** be
 
 ## Common mistakes
 
+- **Registering the document itself as a concept.** Symptoms: a `Concept.id` like `"useEffect docs"` / `"the React tutorial"`, or a `description` starting with "This document…", "This page explains…", "The article covers…". The source is captured by `reference`; `concepts[]` must hold the *subjects discussed in* the source. Future searches like `refmesh search "useEffect"` will not match a node whose description is about a documentation page.
 - **Inventing edge types.** Anything outside the 15 public types fails validation with exit 2.
 - **Empty `relationships`.** If the source actually contains relationships, registering an island of disconnected concepts wastes registration budget.
 - **Skipping the discovery loop.** Failing to probe with `refmesh search` before authoring the payload causes duplicates and orphan islands. The graph stays a list instead of a mesh.
