@@ -114,10 +114,11 @@ refmesh search "useState" --threshold 0.7 --format json      # 類似度 0.7 以
 - `--max-age <days>`: ここより古いノードは結果から除外（デフォルト: 制限なし）
 - `--demote-deprecated <0..1>`: `DEPRECATES` / `REPLACES` のターゲットに掛ける倍率（デフォルト: 0.5、0 で除外）
 - `--reinforcement-weight <0..1>`: アクセス回数による強化の重み（デフォルト: 0、freshness + reinforcement ≤ 1）
+- `--lexical-weight <0..1>`: クエリ語と id/description/details のトークン一致による語彙ブースト（デフォルト: 0.3、cosine と独立した加点軸）
 - `--include-archived`: アーカイブ済みノードも結果に含める
 - `--format <text|json>`: 出力形式（デフォルト: text）
 
-最終スコアは `final = (1 - w_f - w_r) · cosine + w_f · freshness + w_r · reinforcement`（`demoted` のときは更に `demoteDeprecated` 倍）。
+最終スコアは `final = max(0, 1 - w_f - w_r - w_l) · cosine + w_f · freshness + w_r · reinforcement + w_l · lexical`（`demoted` のときは更に `demoteDeprecated` 倍）。
 `freshness = exp(-ln2 · age / halfLife)` で、`age` は `Reference.publishedAt` の最新値（無ければ `Concept.lastSeenAt`）から算出。
 
 #### 登録時の重複検知

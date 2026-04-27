@@ -127,6 +127,11 @@ export function buildProgram(): Command {
       'Weight of access-count reinforcement [0,1] (must satisfy freshness + reinforcement <= 1)',
       '0',
     )
+    .option(
+      '--lexical-weight <value>',
+      'Weight of lexical (token overlap) boost [0,1]; independent additive axis on top of cosine',
+      '0.3',
+    )
     .option('--include-archived', 'Include archived concepts in results', false)
     .option('--format <format>', 'Output format: text | json', 'text')
     .action(
@@ -141,6 +146,7 @@ export function buildProgram(): Command {
           maxAge?: string;
           demoteDeprecated: string;
           reinforcementWeight: string;
+          lexicalWeight: string;
           includeArchived: boolean;
           format: string;
         },
@@ -155,6 +161,7 @@ export function buildProgram(): Command {
             maxAgeDays: opts.maxAge !== undefined ? Number.parseFloat(opts.maxAge) : undefined,
             demoteDeprecated: Number.parseFloat(opts.demoteDeprecated),
             reinforcementWeight: Number.parseFloat(opts.reinforcementWeight),
+            lexicalWeight: Number.parseFloat(opts.lexicalWeight),
             includeArchived: opts.includeArchived,
             format: opts.format === 'json' ? 'json' : 'text',
           };

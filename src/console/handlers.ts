@@ -504,6 +504,7 @@ export interface ConsoleSearchOptions {
   maxAgeDays?: number;
   demoteDeprecated?: number;
   reinforcementWeight?: number;
+  lexicalWeight?: number;
 }
 
 export const DEFAULT_CONSOLE_SEARCH_LIMIT = 10;
@@ -582,6 +583,7 @@ export function parseConsoleSearchOptions(query: URLSearchParams): ConsoleSearch
   const maxAgeDays = parseOptionalPositiveFloat(query, 'maxAgeDays', { allowZero: true });
   const demoteDeprecated = parseOptionalUnitFloat(query, 'demoteDeprecated');
   const reinforcementWeight = parseOptionalUnitFloat(query, 'reinforcementWeight');
+  const lexicalWeight = parseOptionalUnitFloat(query, 'lexicalWeight');
 
   return {
     query: q,
@@ -594,6 +596,7 @@ export function parseConsoleSearchOptions(query: URLSearchParams): ConsoleSearch
     maxAgeDays,
     demoteDeprecated,
     reinforcementWeight,
+    lexicalWeight,
   };
 }
 
@@ -637,6 +640,7 @@ export async function runConsoleSearchDebug(
     maxAgeDays: options.maxAgeDays,
     demoteDeprecated: options.demoteDeprecated,
     reinforcementWeight: options.reinforcementWeight,
+    lexicalWeight: options.lexicalWeight,
     format: 'json',
     readOnly: true,
   };

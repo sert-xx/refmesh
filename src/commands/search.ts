@@ -13,6 +13,11 @@ export const DEFAULT_SEARCH_LIMIT = 5;
 export const DEFAULT_SEARCH_DEPTH = 1;
 export const DEFAULT_HALF_LIFE_DAYS = 180;
 export const DEFAULT_DEMOTE_DEPRECATED = 0.5;
+// Lexical boost is treated as an independent additive axis on top of the
+// cosine/freshness/reinforcement triplet. The default 0.3 is enough to push
+// concepts whose id contains the query token above unrelated cluster-mates
+// while still letting cosine dominate when lexical signals are tied.
+export const DEFAULT_LEXICAL_WEIGHT = 0.3;
 
 export interface SearchOptions {
   depth: number;
@@ -23,6 +28,7 @@ export interface SearchOptions {
   maxAgeDays?: number;
   demoteDeprecated?: number;
   reinforcementWeight?: number;
+  lexicalWeight?: number;
   includeArchived?: boolean;
   format: 'text' | 'json';
   // Skip side effects (e.g., reinforcement accessCount increment).
@@ -41,6 +47,7 @@ export interface SearchConceptNode {
   demoted?: boolean;
   accessCount?: number;
   reinforcement?: number;
+  lexical?: number;
 }
 
 export interface SearchReferenceNode {
@@ -98,6 +105,7 @@ export interface SearchTraceCandidate {
   ageDays: number | null;
   accessCount: number;
   reinforcement: number;
+  lexical: number;
   demoted: boolean;
   archived: boolean;
   finalScore: number;
@@ -117,6 +125,10 @@ export interface SearchTrace {
     preview: number[];
     full: number[];
   };
+  // Tokens derived from the raw query string by the same tokenizer that runs
+  // against id/description/details. Surfaced so users can see what actually
+  // fed the lexical scorer (e.g. "k8s_proxy" → ["k8s", "proxy"]).
+  queryTokens: string[];
   vectorRequest: {
     limit: number;
     oversample: number;
@@ -133,6 +145,7 @@ export interface SearchTrace {
 
 class SearchTraceRecorder {
   private queryEmbedding: SearchTrace['queryEmbedding'] | null = null;
+  private queryTokens: string[] = [];
   private vectorRequest: SearchTrace['vectorRequest'] | null = null;
   private vectorHits: SearchTraceVectorHit[] = [];
   private graphQueries: SearchTraceGraphQuery[] = [];
@@ -149,6 +162,10 @@ class SearchTraceRecorder {
       preview: vec.slice(0, 8),
       full: vec.slice(),
     };
+  }
+
+  recordQueryTokens(tokens: readonly string[]): void {
+    this.queryTokens = [...tokens];
   }
 
   recordVectorRequest(req: SearchTrace['vectorRequest']): void {
@@ -184,6 +201,7 @@ class SearchTraceRecorder {
     }
     return {
       queryEmbedding: this.queryEmbedding,
+      queryTokens: this.queryTokens,
       vectorRequest: this.vectorRequest,
       vectorHits: this.vectorHits,
       graphQueries: this.graphQueries,
@@ -194,6 +212,58 @@ class SearchTraceRecorder {
       },
     };
   }
+}
+
+// Tokenizer shared by lexical scoring and trace surfacing. Splits on
+// whitespace plus typical id-style separators (_, -, ., :, /), then breaks
+// camelCase / PascalCase boundaries (FooBar → Foo, Bar; HTTPServer →
+// HTTP, Server) so identifiers like "GoogleKubernetesEngine" match a
+// "kubernetes" query. Lower-cased so the comparison is case-insensitive.
+// Intentionally no stopword list / stemming — short concept ids are
+// dominated by content words and stripping them creates more bugs than it
+// solves.
+export function tokenize(input: string): string[] {
+  if (!input) return [];
+  const out: string[] = [];
+  for (const piece of input.split(/[\s_\-./:]+/)) {
+    if (piece.length === 0) continue;
+    // Insert a boundary at lower→Upper transitions and at runs-of-uppercase
+    // followed by Title-cased words ("HTTPServer" → "HTTP", "Server").
+    const split = piece
+      .replace(/([a-z0-9])([A-Z])/g, '$1\u0000$2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1\u0000$2')
+      .split('\u0000');
+    for (const token of split) {
+      if (token.length === 0) continue;
+      out.push(token.toLowerCase());
+    }
+  }
+  return out;
+}
+
+function computeLexicalScore(
+  queryTokens: ReadonlySet<string>,
+  idTokens: ReadonlySet<string>,
+  descTokens: ReadonlySet<string>,
+  detailsTokens: ReadonlySet<string>,
+): number {
+  if (queryTokens.size === 0) return 0;
+  let idHits = 0;
+  let descHits = 0;
+  let detailHits = 0;
+  for (const t of queryTokens) {
+    if (idTokens.has(t)) idHits += 1;
+    if (descTokens.has(t)) descHits += 1;
+    if (detailsTokens.has(t)) detailHits += 1;
+  }
+  const idHitFlag = idHits > 0 ? 1 : 0;
+  const denom = queryTokens.size;
+  const score =
+    idHitFlag * 0.5 +
+    (idHits / denom) * 0.3 +
+    (descHits / denom) * 0.15 +
+    (detailHits / denom) * 0.05;
+  return Math.min(1, score);
 }
 
 function idsPreview(ids: readonly string[]): string[] {
@@ -263,6 +333,17 @@ export function validateSearchOptions(opts: SearchOptions): void {
       );
     }
   }
+  if (opts.lexicalWeight !== undefined) {
+    if (!Number.isFinite(opts.lexicalWeight) || opts.lexicalWeight < 0 || opts.lexicalWeight > 1) {
+      throw new RefmeshValidationError(
+        `--lexical-weight must be a number in [0, 1] (got: ${opts.lexicalWeight}).`,
+      );
+    }
+  }
+  // lexicalWeight is an additive axis on top of cosine and is intentionally
+  // excluded from this constraint. The freshness/reinforcement pair already
+  // splits the cosine budget, so widening the constraint to include lexical
+  // would silently break callers that pass freshnessWeight=1.
   const w = opts.freshnessWeight ?? 0;
   const r = opts.reinforcementWeight ?? 0;
   if (w + r > 1 + 1e-9) {
@@ -547,13 +628,20 @@ async function executeSearchCore(
   const threshold = options.threshold ?? DEFAULT_SEARCH_THRESHOLD;
   const freshnessWeight = options.freshnessWeight ?? 0;
   const reinforcementWeight = options.reinforcementWeight ?? 0;
-  const cosineWeight = Math.max(0, 1 - freshnessWeight - reinforcementWeight);
+  const lexicalWeight = options.lexicalWeight ?? DEFAULT_LEXICAL_WEIGHT;
+  // Lexical sits alongside cosine inside the cosine half of the budget;
+  // freshness/reinforcement still own their declared share.
+  const cosineWeight = Math.max(0, 1 - freshnessWeight - reinforcementWeight - lexicalWeight);
   const halfLifeDays = options.halfLifeDays ?? DEFAULT_HALF_LIFE_DAYS;
   const maxAgeDays = options.maxAgeDays;
   const demoteDeprecated = options.demoteDeprecated ?? DEFAULT_DEMOTE_DEPRECATED;
   const includeArchived = options.includeArchived ?? false;
   const conn = stores.graph.connection;
   const now = new Date();
+
+  const queryTokenList = tokenize(query);
+  const queryTokenSet: ReadonlySet<string> = new Set(queryTokenList);
+  recorder?.recordQueryTokens(queryTokenList);
 
   const queryVector = await embed(query);
   recorder?.recordEmbedding(queryVector);
@@ -593,6 +681,7 @@ async function executeSearchCore(
     rawCosine: number;
     rawFreshness: number;
     rawAccess: number;
+    rawLexical: number;
   }
   // One bulk fetch + one bulk freshness call covers every vector hit, instead
   // of N individual round-trips (PBI-13).
@@ -616,6 +705,7 @@ async function executeSearchCore(
           ageDays: null,
           accessCount: 0,
           reinforcement: 0,
+          lexical: 0,
           demoted: false,
           archived: false,
           finalScore: 0,
@@ -624,6 +714,14 @@ async function executeSearchCore(
       }
       continue;
     }
+    // Lexical can be computed as soon as we have the concept; reuse it for
+    // both the partial path and any later exclusion record so debug output
+    // stays consistent.
+    const idTokens = new Set(tokenize(concept.id));
+    const descTokens = new Set(tokenize(concept.description));
+    const detailsTokens = new Set(tokenize(concept.details ?? ''));
+    const lexical = computeLexicalScore(queryTokenSet, idTokens, descTokens, detailsTokens);
+
     const fresh = freshnessMap.get(hit.id);
     if (!fresh) {
       if (recorder) {
@@ -634,6 +732,7 @@ async function executeSearchCore(
           ageDays: null,
           accessCount: 0,
           reinforcement: 0,
+          lexical,
           demoted: false,
           archived: false,
           finalScore: 0,
@@ -652,6 +751,7 @@ async function executeSearchCore(
           ageDays: null,
           accessCount: fresh.accessCount,
           reinforcement: 0,
+          lexical,
           demoted: fresh.isDeprecated,
           archived: true,
           finalScore: 0,
@@ -672,6 +772,7 @@ async function executeSearchCore(
           ageDays: Number.isFinite(age) ? age : null,
           accessCount: fresh.accessCount,
           reinforcement: 0,
+          lexical,
           demoted: fresh.isDeprecated,
           archived,
           finalScore: 0,
@@ -690,6 +791,7 @@ async function executeSearchCore(
           ageDays: Number.isFinite(age) ? age : null,
           accessCount: fresh.accessCount,
           reinforcement: 0,
+          lexical,
           demoted: true,
           archived,
           finalScore: 0,
@@ -707,9 +809,11 @@ async function executeSearchCore(
       ageDays: Number.isFinite(age) ? age : undefined,
       demoted,
       accessCount: fresh.accessCount,
+      lexical,
       rawCosine: hit.score,
       rawFreshness: freshness,
       rawAccess: fresh.accessCount,
+      rawLexical: lexical,
     });
   }
 
@@ -721,7 +825,8 @@ async function executeSearchCore(
     let final =
       cosineWeight * p.rawCosine +
       freshnessWeight * p.rawFreshness +
-      reinforcementWeight * reinforcement;
+      reinforcementWeight * reinforcement +
+      lexicalWeight * p.rawLexical;
     if (p.demoted) final *= demoteDeprecated;
     return {
       id: p.id,
@@ -734,6 +839,7 @@ async function executeSearchCore(
       demoted: p.demoted,
       accessCount: p.accessCount,
       reinforcement,
+      lexical: p.rawLexical,
     };
   });
 
@@ -746,6 +852,7 @@ async function executeSearchCore(
         ageDays: c.ageDays ?? null,
         accessCount: c.accessCount ?? 0,
         reinforcement: c.reinforcement ?? 0,
+        lexical: c.lexical ?? 0,
         demoted: c.demoted ?? false,
         archived: false,
         finalScore: c.finalScore ?? 0,
@@ -840,6 +947,7 @@ export function renderSearchText(result: SearchResult): string {
     if (c.freshness !== undefined) parts.push(`fresh=${c.freshness.toFixed(3)}`);
     if (c.reinforcement !== undefined && c.reinforcement > 0)
       parts.push(`reinf=${c.reinforcement.toFixed(3)}`);
+    if (c.lexical !== undefined && c.lexical > 0) parts.push(`lex=${c.lexical.toFixed(3)}`);
     if (c.accessCount !== undefined && c.accessCount > 0) parts.push(`access=${c.accessCount}`);
     if (c.ageDays !== undefined) parts.push(`age=${c.ageDays.toFixed(1)}d`);
     if (c.finalScore !== undefined) parts.push(`final=${c.finalScore.toFixed(3)}`);
