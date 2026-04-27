@@ -86,6 +86,53 @@ interface SearchResult {
   edges: { source: string; target: string; type: string; reason?: string }[];
 }
 
+interface SearchTraceVectorHit {
+  id: string;
+  text: string;
+  cosine: number;
+  distance: number;
+  passedThreshold: boolean;
+}
+
+interface SearchTraceGraphQuery {
+  label: string;
+  cypher: string;
+  idsPreview: string[];
+}
+
+interface SearchTraceCandidate {
+  id: string;
+  cosine: number;
+  freshness: number;
+  ageDays: number | null;
+  accessCount: number;
+  reinforcement: number;
+  demoted: boolean;
+  archived: boolean;
+  finalScore: number;
+  excluded?: 'archived' | 'maxAge' | 'demoted-zero' | 'concept-missing';
+}
+
+interface SearchTraceLevel {
+  level: number;
+  frontier: string[];
+  edgesAdded: number;
+}
+
+interface SearchTrace {
+  queryEmbedding: { dim: number; l2Norm: number; preview: number[]; full: number[] };
+  vectorRequest: { limit: number; oversample: number; threshold: number };
+  vectorHits: SearchTraceVectorHit[];
+  graphQueries: SearchTraceGraphQuery[];
+  candidates: SearchTraceCandidate[];
+  traversal: { depth: number; levels: SearchTraceLevel[] };
+}
+
+interface SearchDebugResponse {
+  result: SearchResult;
+  trace: SearchTrace;
+}
+
 const EDGE_COLORS: Record<string, string> = {
   IS_A: '#58a6ff',
   PART_OF: '#58a6ff',
@@ -183,7 +230,7 @@ async function api<T>(path: string): Promise<T> {
 
 // --- Tab routing ----------------------------------------------------------
 
-type TabName = 'overview' | 'concepts' | 'search' | 'graph';
+type TabName = 'overview' | 'concepts' | 'search' | 'search-debug' | 'graph';
 let activeTab: TabName = 'overview';
 
 function switchTab(tab: TabName): void {
@@ -492,6 +539,231 @@ function openInGraph(id: string): void {
   void loadGraph();
 }
 
+// --- Search Debug ----------------------------------------------------------
+
+let lastDebugSeed: string | null = null;
+
+function readOptionalNumberValue(selector: string): string | null {
+  const raw = ($(selector) as HTMLInputElement).value.trim();
+  return raw.length > 0 ? raw : null;
+}
+
+async function runSearchDebug(event?: Event): Promise<void> {
+  event?.preventDefault();
+  const q = ($('#search-debug-query') as HTMLInputElement).value.trim();
+  if (q.length === 0) return;
+  const params = new URLSearchParams({
+    q,
+    limit: ($('#search-debug-limit') as HTMLInputElement).value,
+    depth: ($('#search-debug-depth') as HTMLInputElement).value,
+    threshold: ($('#search-debug-threshold') as HTMLInputElement).value,
+    includeArchived: ($('#search-debug-archived') as HTMLInputElement).checked ? 'true' : 'false',
+  });
+  const optionalParams: Array<[string, string]> = [
+    ['freshnessWeight', '#search-debug-freshness-weight'],
+    ['halfLifeDays', '#search-debug-half-life'],
+    ['maxAgeDays', '#search-debug-max-age'],
+    ['demoteDeprecated', '#search-debug-demote'],
+    ['reinforcementWeight', '#search-debug-reinforcement-weight'],
+  ];
+  for (const [key, selector] of optionalParams) {
+    const v = readOptionalNumberValue(selector);
+    if (v !== null) params.set(key, v);
+  }
+
+  setStatus(`debug-searching: ${q}…`);
+  const result = $('#search-debug-result');
+  result.innerHTML = '<p class="muted">…</p>';
+
+  try {
+    const data = await api<SearchDebugResponse>(`/api/search/debug?${params.toString()}`);
+    lastDebugSeed = data.result.matchedConcepts[0]?.id ?? null;
+    ($('#search-debug-graph-btn') as HTMLButtonElement).disabled = lastDebugSeed === null;
+    renderSearchDebug(result, data);
+    setStatus(
+      `trace: vec hits=${data.trace.vectorHits.length} (passed=${data.trace.vectorHits.filter((h) => h.passedThreshold).length}) · candidates=${data.trace.candidates.length}`,
+    );
+  } catch (err) {
+    showError(result, err);
+    setStatus('search debug failed', 'error');
+  }
+}
+
+function renderSearchDebug(target: HTMLElement, data: SearchDebugResponse): void {
+  const { result, trace } = data;
+  const passed = trace.vectorHits.filter((h) => h.passedThreshold).length;
+  const rejected = trace.vectorHits.length - passed;
+  const matchedSet = new Set(result.matchedConcepts.map((c) => c.id));
+
+  target.innerHTML = `
+    <section class="debug-section">
+      <h3>Query embedding</h3>
+      <div class="debug-meta">
+        dim=${trace.queryEmbedding.dim} · L2=${trace.queryEmbedding.l2Norm.toFixed(4)}
+      </div>
+      <div class="debug-mono">[${trace.queryEmbedding.preview
+        .map((v) => v.toFixed(4))
+        .join(', ')}, …]</div>
+      <details>
+        <summary>全 ${trace.queryEmbedding.full.length} 次元を表示</summary>
+        <pre class="debug-pre">[${trace.queryEmbedding.full
+          .map((v) => v.toFixed(6))
+          .join(', ')}]</pre>
+      </details>
+    </section>
+
+    <section class="debug-section">
+      <h3>Vector request</h3>
+      <div class="debug-meta">
+        limit (oversample) = ${trace.vectorRequest.oversample} ·
+        threshold = ${trace.vectorRequest.threshold}
+      </div>
+    </section>
+
+    <section class="debug-section">
+      <h3>Vector hits (threshold 前 ${trace.vectorHits.length} 件 · 通過 ${passed} · 棄却 ${rejected})</h3>
+      ${
+        trace.vectorHits.length === 0
+          ? '<p class="muted">no hits</p>'
+          : `<div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>id</th>
+              <th>text</th>
+              <th>cosine</th>
+              <th>distance</th>
+              <th>threshold</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${trace.vectorHits
+              .map(
+                (h) => `
+                  <tr class="${h.passedThreshold ? '' : 'debug-rejected-row'}">
+                    <td class="id-cell" data-id="${escapeHtml(h.id)}">${escapeHtml(h.id)}</td>
+                    <td>${escapeHtml(h.text)}</td>
+                    <td>${h.cosine.toFixed(4)}</td>
+                    <td>${h.distance.toFixed(4)}</td>
+                    <td>${h.passedThreshold ? '✓' : '✗ rejected'}</td>
+                  </tr>`,
+              )
+              .join('')}
+          </tbody>
+        </table>
+      </div>`
+      }
+    </section>
+
+    <section class="debug-section">
+      <h3>Graph queries (${trace.graphQueries.length})</h3>
+      ${trace.graphQueries
+        .map(
+          (q) => `
+            <div class="debug-query">
+              <div class="debug-meta">
+                <strong>${escapeHtml(q.label)}</strong>
+                ${
+                  q.idsPreview.length > 0
+                    ? ` · ids: [${q.idsPreview
+                        .map((id) => escapeHtml(id))
+                        .join(', ')}${q.idsPreview.length >= 5 ? ', …' : ''}]`
+                    : ''
+                }
+              </div>
+              <pre class="debug-pre">${escapeHtml(q.cypher)}</pre>
+            </div>`,
+        )
+        .join('')}
+    </section>
+
+    <section class="debug-section">
+      <h3>Scoring breakdown (${trace.candidates.length})</h3>
+      ${
+        trace.candidates.length === 0
+          ? '<p class="muted">no candidates</p>'
+          : `<div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>id</th>
+              <th>cosine</th>
+              <th>freshness</th>
+              <th>age (d)</th>
+              <th>access</th>
+              <th>reinf</th>
+              <th>flags</th>
+              <th>final</th>
+              <th>status</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${trace.candidates
+              .map((c) => {
+                const status = c.excluded
+                  ? `<span class="badge debug-excluded">${escapeHtml(c.excluded)}</span>`
+                  : matchedSet.has(c.id)
+                    ? '<span class="badge debug-matched">matched</span>'
+                    : '<span class="badge">candidate</span>';
+                const flags = [c.demoted ? 'demoted' : '', c.archived ? 'archived' : '']
+                  .filter((s) => s.length > 0)
+                  .join(' · ');
+                return `
+                  <tr class="${c.excluded ? 'debug-rejected-row' : ''}">
+                    <td class="id-cell" data-id="${escapeHtml(c.id)}">${escapeHtml(c.id)}</td>
+                    <td>${c.cosine.toFixed(4)}</td>
+                    <td>${c.freshness.toFixed(4)}</td>
+                    <td>${c.ageDays === null ? '—' : c.ageDays.toFixed(1)}</td>
+                    <td>${c.accessCount}</td>
+                    <td>${c.reinforcement.toFixed(4)}</td>
+                    <td>${flags}</td>
+                    <td>${c.finalScore.toFixed(4)}</td>
+                    <td>${status}</td>
+                  </tr>`;
+              })
+              .join('')}
+          </tbody>
+        </table>
+      </div>`
+      }
+    </section>
+
+    <section class="debug-section">
+      <h3>Graph traversal (depth=${trace.traversal.depth})</h3>
+      ${
+        trace.traversal.levels.length === 0
+          ? '<p class="muted">no traversal (depth 0 か matched 0 件)</p>'
+          : `<ul class="debug-traversal">
+              ${trace.traversal.levels
+                .map(
+                  (l) => `
+                  <li>
+                    <strong>level ${l.level}</strong>:
+                    frontier ${l.frontier.length} 件 · edges +${l.edgesAdded}
+                    ${
+                      l.frontier.length > 0
+                        ? `<div class="debug-mono">[${l.frontier
+                            .slice(0, 8)
+                            .map(escapeHtml)
+                            .join(', ')}${l.frontier.length > 8 ? ', …' : ''}]</div>`
+                        : ''
+                    }
+                  </li>`,
+                )
+                .join('')}
+            </ul>`
+      }
+    </section>
+  `;
+
+  for (const cell of target.querySelectorAll<HTMLElement>('.id-cell')) {
+    cell.addEventListener('click', () => {
+      const id = cell.dataset['id'];
+      if (id) openInGraph(id);
+    });
+  }
+}
+
 // --- Graph -----------------------------------------------------------------
 
 let cy: Core | null = null;
@@ -764,6 +1036,11 @@ function bindUI(): void {
   $('#search-form').addEventListener('submit', runSearch);
   $('#search-graph-btn').addEventListener('click', () => {
     if (lastSearchSeed) openInGraph(lastSearchSeed);
+  });
+
+  $('#search-debug-form').addEventListener('submit', runSearchDebug);
+  $('#search-debug-graph-btn').addEventListener('click', () => {
+    if (lastDebugSeed) openInGraph(lastDebugSeed);
   });
 
   $('#graph-load').addEventListener('click', () => {

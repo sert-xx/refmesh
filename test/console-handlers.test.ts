@@ -372,5 +372,43 @@ describe('console handlers', () => {
       });
       expect(result.matchedConcepts.map((c) => c.id)).toContain('Lookup');
     });
+
+    it('ignores debug-only scoring params on /api/search to preserve the legacy contract', async () => {
+      // PBI-16 explicitly forbids changing /api/search behavior. Even when a
+      // caller passes freshnessWeight=1 (which would normally collapse cosine
+      // ranking entirely), runConsoleSearch must behave exactly as if the
+      // param was absent.
+      await executeRegister(
+        stores,
+        parseAndValidate(
+          payload('https://example.com/legacy', [
+            { id: 'LegacyHit', description: 'legacy contract target' },
+          ]),
+        ),
+      );
+      const baseline = await runConsoleSearch(stores, {
+        query: 'legacy contract target',
+        limit: 5,
+        depth: 0,
+        threshold: 0,
+        includeArchived: false,
+      });
+      const withDebugParams = await runConsoleSearch(stores, {
+        query: 'legacy contract target',
+        limit: 5,
+        depth: 0,
+        threshold: 0,
+        includeArchived: false,
+        // These should be silently dropped by /api/search.
+        freshnessWeight: 1,
+        halfLifeDays: 1,
+        maxAgeDays: 0,
+        demoteDeprecated: 0,
+        reinforcementWeight: 1,
+      });
+      expect(withDebugParams.matchedConcepts.map((c) => c.id)).toEqual(
+        baseline.matchedConcepts.map((c) => c.id),
+      );
+    });
   });
 });

@@ -142,6 +142,7 @@ refmesh console --no-open      # ブラウザを開かず URL だけ表示
 - **Overview**: Concept / Reference / Edge 件数、Edge type 別の分布、Kùzu / LanceDB のパスとサイズ。
 - **Concepts**: 一覧 + ページング + ソート (lastSeenAt / touchCount / id)。`archived` も任意で表示。
 - **Search**: 自然言語クエリで `refmesh search` 相当のスコアリング検索を実行。
+- **Search Debug**: 検索パイプラインを段階別に可視化。クエリ埋め込みの形状 (dim / L2ノルム / 全次元プレビュー)、LanceDB に投げた `oversample` と `threshold` 前の全ベクトルヒット (棄却分含む)、Kùzu に発行された Cypher 一覧、各候補のスコア内訳 (cosine / freshness / reinforcement / final と除外理由)、近傍展開の各 level のフロンティア・追加 edge 数を表示する。`accessCount` を更新しない読み取り専用。
 - **Graph**: 起点 Concept を指定するとグラフを描画。**ノードクリックで近傍を増分展開**でき、Edge type ごとに色分けされる。
 
 `Ctrl+C` で停止し、Kùzu / LanceDB のコネクションをクリーンに閉じる。

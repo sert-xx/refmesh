@@ -16,6 +16,7 @@
         <button class="tab" data-tab="overview" type="button">Overview</button>
         <button class="tab" data-tab="concepts" type="button">Concepts</button>
         <button class="tab" data-tab="search" type="button">Search</button>
+        <button class="tab" data-tab="search-debug" type="button">Search Debug</button>
         <button class="tab" data-tab="graph" type="button">Graph</button>
       </nav>
       <div class="topbar-spacer"></div>
@@ -81,6 +82,83 @@
           </button>
         </form>
         <div id="search-result"></div>
+      </section>
+
+      <section class="view" data-view="search-debug" hidden>
+        <h2>Search Debug</h2>
+        <p class="hint">
+          検索パイプラインの内部値を可視化します。本タブの実行は副作用なし
+          (accessCount は更新されません)。
+        </p>
+        <form id="search-debug-form" class="row-controls">
+          <input
+            id="search-debug-query"
+            type="search"
+            placeholder="自然言語クエリ"
+            autocomplete="off"
+          />
+          <label>
+            limit
+            <input id="search-debug-limit" type="number" min="1" max="100" value="10" />
+          </label>
+          <label>
+            depth
+            <input id="search-debug-depth" type="number" min="0" max="4" value="1" />
+          </label>
+          <label>
+            threshold
+            <input id="search-debug-threshold" type="number" min="0" max="1" step="0.05" value="0.3" />
+          </label>
+          <label>
+            freshness-weight
+            <input
+              id="search-debug-freshness-weight"
+              type="number"
+              min="0"
+              max="1"
+              step="0.05"
+              value="0"
+            />
+          </label>
+          <label>
+            half-life (days)
+            <input id="search-debug-half-life" type="number" min="1" step="1" value="180" />
+          </label>
+          <label>
+            max-age (days)
+            <input id="search-debug-max-age" type="number" min="0" step="1" placeholder="-" />
+          </label>
+          <label>
+            demote-deprecated
+            <input
+              id="search-debug-demote"
+              type="number"
+              min="0"
+              max="1"
+              step="0.05"
+              value="0.5"
+            />
+          </label>
+          <label>
+            reinforcement-weight
+            <input
+              id="search-debug-reinforcement-weight"
+              type="number"
+              min="0"
+              max="1"
+              step="0.05"
+              value="0"
+            />
+          </label>
+          <label class="inline-checkbox">
+            <input type="checkbox" id="search-debug-archived" /> archived
+          </label>
+          <button type="submit" class="primary-btn">Run</button>
+          <button id="search-debug-graph-btn" type="button" class="ghost-btn" disabled>
+            グラフで開く
+          </button>
+        </form>
+        <div id="search-debug-result"></div>
       </section>
 
       <section class="view" data-view="graph" hidden>

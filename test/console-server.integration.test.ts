@@ -161,6 +161,70 @@ describe('console HTTP server', () => {
     expect(res.status).toBe(404);
   });
 
+  it('exposes /api/search/debug with a populated trace payload', async () => {
+    await executeRegister(
+      stores,
+      parseAndValidate(
+        JSON.stringify({
+          reference: { url: 'https://example.com/debug', title: 'debug' },
+          concepts: [
+            { id: 'DebugTarget', description: 'observable target' },
+            { id: 'OtherSide', description: 'unrelated noise about volcanoes' },
+          ],
+          relationships: [],
+        }),
+      ),
+    );
+    const res = await fetchJson(
+      `${server.url}/api/search/debug?q=${encodeURIComponent('observable target')}&threshold=0&depth=0`,
+    );
+    expect(res.status).toBe(200);
+    const body = res.body as {
+      result: { matchedConcepts: { id: string }[] };
+      trace: {
+        queryEmbedding: { dim: number };
+        vectorRequest: { threshold: number };
+        vectorHits: { id: string; passedThreshold: boolean }[];
+        graphQueries: { label: string }[];
+        candidates: { id: string }[];
+        traversal: { depth: number };
+      };
+    };
+    expect(body.result.matchedConcepts.some((c) => c.id === 'DebugTarget')).toBe(true);
+    expect(body.trace.queryEmbedding.dim).toBeGreaterThan(0);
+    expect(body.trace.vectorRequest.threshold).toBe(0);
+    expect(body.trace.vectorHits.length).toBeGreaterThan(0);
+    expect(body.trace.graphQueries.some((q) => q.label === 'concepts.byIds')).toBe(true);
+    expect(body.trace.traversal.depth).toBe(0);
+  });
+
+  it('rejects /api/search/debug with empty q', async () => {
+    const res = await fetchJson(`${server.url}/api/search/debug?q=`);
+    expect(res.status).toBe(400);
+  });
+
+  it('does not increment accessCount via /api/search/debug (read-only)', async () => {
+    await executeRegister(
+      stores,
+      parseAndValidate(
+        JSON.stringify({
+          reference: { url: 'https://example.com/ro-debug', title: 'ro-debug' },
+          concepts: [{ id: 'DebugRO', description: 'read only debug target' }],
+          relationships: [],
+        }),
+      ),
+    );
+    const res = await fetchJson(
+      `${server.url}/api/search/debug?q=${encodeURIComponent('read only debug target')}&threshold=0`,
+    );
+    expect(res.status).toBe(200);
+    const after = await stores.graph.connection.query(
+      "MATCH (c:Concept) WHERE c.id = 'DebugRO' RETURN c.accessCount AS n",
+    );
+    const rows = await after.getAll();
+    expect(Number(rows[0]?.['n'] ?? 0)).toBe(0);
+  });
+
   it('refuses symlinks that point outside the static root', async () => {
     // Place a sensitive file outside the static dir, then create a symlink
     // inside the static dir that points at it. The server must refuse to

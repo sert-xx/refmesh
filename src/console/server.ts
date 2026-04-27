@@ -15,6 +15,7 @@ import {
   parseListConceptsOptions,
   parseNeighborsOptions,
   runConsoleSearch,
+  runConsoleSearchDebug,
 } from './handlers.js';
 
 export interface ConsoleServerOptions {
@@ -181,6 +182,10 @@ export async function handleApiRequest(
     if (pathname === '/api/search') {
       const opts = parseConsoleSearchOptions(search);
       return { status: 200, body: await runConsoleSearch(stores, opts) };
+    }
+    if (pathname === '/api/search/debug') {
+      const opts = parseConsoleSearchOptions(search);
+      return { status: 200, body: await runConsoleSearchDebug(stores, opts) };
     }
     return { status: 404, body: { error: 'unknown api endpoint' } };
   } catch (err) {
