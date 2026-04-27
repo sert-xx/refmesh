@@ -313,20 +313,16 @@ async function renderOverview(): Promise<void> {
 
     const storage = $('#storage-info');
     storage.innerHTML = '';
-    const storageItems = [
-      { label: 'Graph (Kùzu)', path: stats.graph.path, size: stats.graph.sizeBytes },
-      { label: 'Vector (LanceDB)', path: stats.vector.path, size: stats.vector.sizeBytes },
-    ];
-    for (const item of storageItems) {
-      const card = document.createElement('div');
-      card.className = 'card';
-      card.innerHTML = `
-        <div class="label">${escapeHtml(item.label)}</div>
-        <div class="value" style="font-size:14px; word-break:break-all;">${escapeHtml(item.path)}</div>
-        <div class="sub">${escapeHtml(formatBytes(item.size))}</div>
-      `;
-      storage.appendChild(card);
-    }
+    // Graph and vector storage were unified into a single SQLite file in
+    // PBI-18, so stats.graph.path === stats.vector.path. Render one card.
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <div class="label">Database (SQLite)</div>
+      <div class="value" style="font-size:14px; word-break:break-all;">${escapeHtml(stats.graph.path)}</div>
+      <div class="sub">${escapeHtml(formatBytes(stats.graph.sizeBytes))}</div>
+    `;
+    storage.appendChild(card);
 
     setStatus(
       `stats: concepts=${stats.counts.concepts}, edges=${stats.counts.edgesTotal}, refs=${stats.counts.references}`,
