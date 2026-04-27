@@ -25,7 +25,7 @@ import {
   renderSearchText,
 } from './commands/search.js';
 import { runTypesCommand } from './commands/types.js';
-import { openHybridStores } from './db/connection.js';
+import { withHybridStores } from './db/connection.js';
 import { RefmeshRuntimeError, RefmeshValidationError } from './util/errors.js';
 import { stderrLogger } from './util/logger.js';
 
@@ -94,8 +94,7 @@ export function buildProgram(): Command {
       try {
         const raw = await readRegisterInput({ file: opts.file });
         const input = parseAndValidate(raw);
-        const stores = await openHybridStores();
-        const summary = await executeRegister(stores, input);
+        const summary = await withHybridStores((stores) => executeRegister(stores, input));
         process.stdout.write(`${renderRegisterSummary(summary)}\n`);
       } catch (err) {
         handleError(err);
@@ -159,8 +158,7 @@ export function buildProgram(): Command {
             includeArchived: opts.includeArchived,
             format: opts.format === 'json' ? 'json' : 'text',
           };
-          const stores = await openHybridStores();
-          const result = await executeSearch(stores, query, options);
+          const result = await withHybridStores((stores) => executeSearch(stores, query, options));
           const output =
             options.format === 'json' ? renderSearchJson(result) : renderSearchText(result);
           process.stdout.write(`${output}\n`);
@@ -177,8 +175,9 @@ export function buildProgram(): Command {
     .option('--reason <text>', 'Reason for archiving (free text)')
     .action(async (id: string, opts: { reason?: string }) => {
       try {
-        const stores = await openHybridStores();
-        const result = await executeArchive(stores, id, { reason: opts.reason });
+        const result = await withHybridStores((stores) =>
+          executeArchive(stores, id, { reason: opts.reason }),
+        );
         process.stdout.write(`${renderArchiveResult(result)}\n`);
       } catch (err) {
         handleError(err);
@@ -191,8 +190,7 @@ export function buildProgram(): Command {
     .argument('<id>', 'Concept id to unarchive')
     .action(async (id: string) => {
       try {
-        const stores = await openHybridStores();
-        const result = await executeUnarchive(stores, id);
+        const result = await withHybridStores((stores) => executeUnarchive(stores, id));
         process.stdout.write(`${renderUnarchiveResult(result)}\n`);
       } catch (err) {
         handleError(err);
@@ -216,13 +214,14 @@ export function buildProgram(): Command {
         apply: boolean;
       }) => {
         try {
-          const stores = await openHybridStores();
-          const result = await executePrune(stores, {
-            olderThanDays: Number.parseFloat(opts.olderThan),
-            maxTouches: Number.parseInt(opts.maxTouches, 10),
-            includeArchived: opts.includeArchived,
-            apply: opts.apply,
-          });
+          const result = await withHybridStores((stores) =>
+            executePrune(stores, {
+              olderThanDays: Number.parseFloat(opts.olderThan),
+              maxTouches: Number.parseInt(opts.maxTouches, 10),
+              includeArchived: opts.includeArchived,
+              apply: opts.apply,
+            }),
+          );
           process.stdout.write(`${renderPruneResult(result)}\n`);
         } catch (err) {
           handleError(err);
@@ -278,5 +277,12 @@ const invokedDirectly = (() => {
 })();
 
 if (invokedDirectly) {
-  main().catch(handleError);
+  main()
+    .then(() => {
+      // Skip V8 teardown's second pass over Kùzu's native destructor (see
+      // src/commands/console.ts for the segfault history). Stores have
+      // already been closed inside each action via withHybridStores.
+      process.exit(process.exitCode ?? 0);
+    })
+    .catch(handleError);
 }
