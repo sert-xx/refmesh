@@ -2,11 +2,13 @@
 
 自律型コーディングエージェント（Claude Code 等）向けの **ハイブリッド・ナレッジグラフ構築CLI**。
 公式ドキュメントやリファレンスから抽出した「概念（ノード）」と「関係性（エッジ）」を、
-ローカルの [Kùzu](https://kuzudb.com/) グラフDB + [LanceDB](https://lancedb.com/) Vector Store に保存し、
-自然言語による意味検索とグラフ探索を同時に行える。
+1 ファイルの [SQLite](https://www.sqlite.org/) DB に保存し、
+ベクトル意味検索 + BM25 全文検索 + グラフ探索を同時に行える。
 
-- **Graph Store (Kùzu):** ノードとエッジの構造（依存・構成・比較等）を保持。
-- **Vector Store (LanceDB):** Concept のテキストを埋め込みベクトル化し、意味検索の入口を担う。
+- **Storage:** `better-sqlite3` 単一 DB ファイル (`~/.refmesh/refmesh.db`)。`PRAGMA journal_mode=WAL` + 外部キー有効。
+- **Vector index:** インメモリ Float32Array + 正規化済みコサイン類似度（起動時に SQLite から読み出し）。
+- **Full-text:** SQLite **FTS5** (Okapi BM25, 多言語 `unicode61 remove_diacritics 2` トークナイザ)。
+- **Graph traversal:** edges テーブルへの BFS（公開エッジ種別ごとに depth 階層展開）。
 - **Embedding:** `@xenova/transformers` + `Xenova/paraphrase-multilingual-MiniLM-L12-v2`（多言語384次元）。
   Python 依存なしで Node.js プロセス内でベクトルを生成。
 
@@ -23,8 +25,9 @@ refmesh types          # 動作確認
 ```
 
 > [!IMPORTANT]
-> **macOS は arm64 の Node.js が必須**。LanceDB のネイティブバイナリが darwin-arm64 のみ配布されているため、x64 の Node（Volta の旧版など）では `MODULE_NOT_FOUND` で起動できない。
-> Apple Silicon 機なら `mise` / `fnm` / `nvm` 等で arm64 Node を入れて使うこと。Linux x64 / arm64 と Windows x64 はそのまま動作する。
+> **既存ユーザーへの注意 (PBI-18 で SQLite に統合):** 旧バージョン (Kùzu + LanceDB) のローカル DB (`~/.refmesh/graph.kuzu` および `~/.refmesh/vectors.lance`) との互換性はありません。アップグレード後は両ディレクトリを削除し、`refmesh register` で再投入してください。新 DB は `~/.refmesh/refmesh.db` 1 ファイルにまとまります。
+>
+> `better-sqlite3` はネイティブビルドが必要ですが、メジャー OS / Node.js バージョン向けにプリビルトが配布されているため通常は `npm install` だけで完了します。
 >
 > 初回 `refmesh search` 実行時に Hugging Face Hub から多言語埋め込みモデル（約 80 MB）を `~/.cache/huggingface/` に取得する。以降はオフライン動作。
 
@@ -115,10 +118,12 @@ refmesh search "useState" --threshold 0.7 --format json      # 類似度 0.7 以
 - `--demote-deprecated <0..1>`: `DEPRECATES` / `REPLACES` のターゲットに掛ける倍率（デフォルト: 0.5、0 で除外）
 - `--reinforcement-weight <0..1>`: アクセス回数による強化の重み（デフォルト: 0、freshness + reinforcement ≤ 1）
 - `--lexical-weight <0..1>`: クエリ語と id/description/details のトークン一致による語彙ブースト（デフォルト: 0.3、cosine と独立した加点軸）
+- `--bm25-weight <0..1>`: SQLite FTS5 (BM25) による全文検索ブースト（デフォルト: 0.3、cosine と独立した加点軸）
 - `--include-archived`: アーカイブ済みノードも結果に含める
 - `--format <text|json>`: 出力形式（デフォルト: text）
 
-最終スコアは `final = max(0, 1 - w_f - w_r - w_l) · cosine + w_f · freshness + w_r · reinforcement + w_l · lexical`（`demoted` のときは更に `demoteDeprecated` 倍）。
+最終スコアは `final = max(0, 1 - w_f - w_r - w_l - w_b) · cosine + w_f · freshness + w_r · reinforcement + w_l · lexical + w_b · bm25`（`demoted` のときは更に `demoteDeprecated` 倍）。
+候補集合はベクトル top-K と FTS5 top-K の **和集合** で取り、両方の score を Concept 単位でマージしてから再ランクするので、片方の retriever にしかヒットしない概念も拾えます。
 `freshness = exp(-ln2 · age / halfLife)` で、`age` は `Reference.publishedAt` の最新値（無ければ `Concept.lastSeenAt`）から算出。
 
 #### 登録時の重複検知

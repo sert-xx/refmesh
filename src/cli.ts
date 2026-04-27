@@ -25,7 +25,7 @@ import {
   renderSearchText,
 } from './commands/search.js';
 import { runTypesCommand } from './commands/types.js';
-import { withHybridStores } from './db/connection.js';
+import { withStore } from './db/store.js';
 import { RefmeshRuntimeError, RefmeshValidationError } from './util/errors.js';
 import { stderrLogger } from './util/logger.js';
 
@@ -94,7 +94,7 @@ export function buildProgram(): Command {
       try {
         const raw = await readRegisterInput({ file: opts.file });
         const input = parseAndValidate(raw);
-        const summary = await withHybridStores((stores) => executeRegister(stores, input));
+        const summary = await withStore((stores) => executeRegister(stores, input));
         process.stdout.write(`${renderRegisterSummary(summary)}\n`);
       } catch (err) {
         handleError(err);
@@ -132,6 +132,11 @@ export function buildProgram(): Command {
       'Weight of lexical (token overlap) boost [0,1]; independent additive axis on top of cosine',
       '0.3',
     )
+    .option(
+      '--bm25-weight <value>',
+      'Weight of BM25 full-text boost [0,1]; independent additive axis on top of cosine',
+      '0.3',
+    )
     .option('--include-archived', 'Include archived concepts in results', false)
     .option('--format <format>', 'Output format: text | json', 'text')
     .action(
@@ -147,6 +152,7 @@ export function buildProgram(): Command {
           demoteDeprecated: string;
           reinforcementWeight: string;
           lexicalWeight: string;
+          bm25Weight: string;
           includeArchived: boolean;
           format: string;
         },
@@ -162,10 +168,11 @@ export function buildProgram(): Command {
             demoteDeprecated: Number.parseFloat(opts.demoteDeprecated),
             reinforcementWeight: Number.parseFloat(opts.reinforcementWeight),
             lexicalWeight: Number.parseFloat(opts.lexicalWeight),
+            bm25Weight: Number.parseFloat(opts.bm25Weight),
             includeArchived: opts.includeArchived,
             format: opts.format === 'json' ? 'json' : 'text',
           };
-          const result = await withHybridStores((stores) => executeSearch(stores, query, options));
+          const result = await withStore((stores) => executeSearch(stores, query, options));
           const output =
             options.format === 'json' ? renderSearchJson(result) : renderSearchText(result);
           process.stdout.write(`${output}\n`);
@@ -182,7 +189,7 @@ export function buildProgram(): Command {
     .option('--reason <text>', 'Reason for archiving (free text)')
     .action(async (id: string, opts: { reason?: string }) => {
       try {
-        const result = await withHybridStores((stores) =>
+        const result = await withStore((stores) =>
           executeArchive(stores, id, { reason: opts.reason }),
         );
         process.stdout.write(`${renderArchiveResult(result)}\n`);
@@ -197,7 +204,7 @@ export function buildProgram(): Command {
     .argument('<id>', 'Concept id to unarchive')
     .action(async (id: string) => {
       try {
-        const result = await withHybridStores((stores) => executeUnarchive(stores, id));
+        const result = await withStore((stores) => executeUnarchive(stores, id));
         process.stdout.write(`${renderUnarchiveResult(result)}\n`);
       } catch (err) {
         handleError(err);
@@ -221,7 +228,7 @@ export function buildProgram(): Command {
         apply: boolean;
       }) => {
         try {
-          const result = await withHybridStores((stores) =>
+          const result = await withStore((stores) =>
             executePrune(stores, {
               olderThanDays: Number.parseFloat(opts.olderThan),
               maxTouches: Number.parseInt(opts.maxTouches, 10),
@@ -288,7 +295,7 @@ if (invokedDirectly) {
     .then(() => {
       // Skip V8 teardown's second pass over Kùzu's native destructor (see
       // src/commands/console.ts for the segfault history). Stores have
-      // already been closed inside each action via withHybridStores.
+      // already been closed inside each action via withStore.
       process.exit(process.exitCode ?? 0);
     })
     .catch(handleError);

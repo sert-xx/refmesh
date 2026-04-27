@@ -1,4 +1,4 @@
-import type { KuzuConnection, RefmeshHybridStores } from '../db/connection.js';
+import type { RefmeshStore } from '../db/store.js';
 import { RefmeshValidationError } from '../util/errors.js';
 
 export interface ArchiveOptions {
@@ -38,61 +38,42 @@ export interface PruneResult {
   applied: boolean;
 }
 
-async function queryAll(
-  conn: KuzuConnection,
-  stmt: string,
-  params: Record<string, unknown> = {},
-): Promise<Record<string, unknown>[]> {
-  if (Object.keys(params).length === 0) {
-    const res = await conn.query(stmt);
-    return res.getAll();
-  }
-  const prepared = await conn.prepare(stmt);
-  const res = await conn.execute(prepared, params);
-  return res.getAll();
+function conceptExists(store: RefmeshStore, id: string): boolean {
+  const row = store.db.prepare<[string]>('SELECT 1 AS one FROM concepts WHERE id = ?').get(id);
+  return row !== undefined;
 }
 
-async function conceptExists(conn: KuzuConnection, id: string): Promise<boolean> {
-  const rows = await queryAll(conn, 'MATCH (c:Concept) WHERE c.id = $id RETURN c.id AS id', {
-    id,
-  });
-  return rows.length > 0;
+function parseIso(value: string | null): Date | null {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 export async function executeArchive(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   id: string,
   options: ArchiveOptions = {},
 ): Promise<ArchiveResult> {
-  const conn = stores.graph.connection;
-  if (!(await conceptExists(conn, id))) {
+  if (!conceptExists(store, id)) {
     throw new RefmeshValidationError(`Concept not found: ${id}`);
   }
   const now = new Date();
   const reason = options.reason ?? '';
-  await queryAll(
-    conn,
-    `MATCH (c:Concept) WHERE c.id = $id
-     SET c.archivedAt = $now, c.archiveReason = $reason`,
-    { id, now, reason },
-  );
+  store.db
+    .prepare<[string, string, string]>(
+      'UPDATE concepts SET archived_at = ?, archive_reason = ? WHERE id = ?',
+    )
+    .run(now.toISOString(), reason, id);
   return { id, archivedAt: now, reason };
 }
 
-export async function executeUnarchive(
-  stores: RefmeshHybridStores,
-  id: string,
-): Promise<UnarchiveResult> {
-  const conn = stores.graph.connection;
-  if (!(await conceptExists(conn, id))) {
+export async function executeUnarchive(store: RefmeshStore, id: string): Promise<UnarchiveResult> {
+  if (!conceptExists(store, id)) {
     throw new RefmeshValidationError(`Concept not found: ${id}`);
   }
-  await queryAll(
-    conn,
-    `MATCH (c:Concept) WHERE c.id = $id
-     SET c.archivedAt = NULL, c.archiveReason = ''`,
-    { id },
-  );
+  store.db
+    .prepare<[string]>('UPDATE concepts SET archived_at = NULL, archive_reason = NULL WHERE id = ?')
+    .run(id);
   return { id };
 }
 
@@ -110,30 +91,34 @@ export function validatePruneOptions(opts: PruneOptions): void {
 }
 
 export async function executePrune(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   options: PruneOptions,
 ): Promise<PruneResult> {
   validatePruneOptions(options);
-  const conn = stores.graph.connection;
   const now = new Date();
   const cutoff = new Date(now.getTime() - options.olderThanDays * 24 * 60 * 60 * 1000);
+  const archivedClause = options.includeArchived ? '' : ' AND archived_at IS NULL';
 
-  const archivedClause = options.includeArchived ? '' : ' AND c.archivedAt IS NULL';
-  const rows = await queryAll(
-    conn,
-    `MATCH (c:Concept)
-     WHERE c.lastSeenAt IS NOT NULL AND c.lastSeenAt < $cutoff
-       AND c.touchCount <= $maxTouches${archivedClause}
-     RETURN c.id AS id, c.lastSeenAt AS lastSeenAt, c.touchCount AS touchCount,
-            c.archivedAt AS archivedAt`,
-    { cutoff, maxTouches: options.maxTouches },
-  );
+  const rows = store.db
+    .prepare<[string, number]>(
+      `SELECT id, last_seen_at, touch_count, archived_at
+         FROM concepts
+        WHERE last_seen_at IS NOT NULL
+          AND last_seen_at < ?
+          AND touch_count <= ?${archivedClause}`,
+    )
+    .all(cutoff.toISOString(), options.maxTouches) as Array<{
+    id: string;
+    last_seen_at: string | null;
+    touch_count: number;
+    archived_at: string | null;
+  }>;
 
   const candidates: PruneCandidate[] = rows.map((r) => ({
-    id: String(r['id'] ?? ''),
-    lastSeenAt: r['lastSeenAt'] instanceof Date ? (r['lastSeenAt'] as Date) : null,
-    touchCount: Number(r['touchCount'] ?? 0),
-    archivedAt: r['archivedAt'] instanceof Date ? (r['archivedAt'] as Date) : null,
+    id: r.id,
+    lastSeenAt: parseIso(r.last_seen_at),
+    touchCount: r.touch_count,
+    archivedAt: parseIso(r.archived_at),
   }));
 
   if (!options.apply) {
@@ -147,18 +132,23 @@ export async function executePrune(
     };
   }
 
+  // Delete inside a transaction so the FK CASCADE on edges/describes/vectors
+  // can't leave orphans if a row mid-way through fails to delete.
   let deleted = 0;
   let vectorsDeleted = 0;
-  for (const c of candidates) {
-    await queryAll(conn, 'MATCH (c:Concept) WHERE c.id = $id DETACH DELETE c', { id: c.id });
-    deleted += 1;
-    try {
-      await stores.vector.deleteById(c.id);
-      vectorsDeleted += 1;
-    } catch {
-      // ignore individual vector delete failures; CLI will surface aggregate count.
+  store.transaction(() => {
+    const stmt = store.db.prepare<[string]>('DELETE FROM concepts WHERE id = ?');
+    for (const c of candidates) {
+      const result = stmt.run(c.id);
+      if (result.changes > 0) {
+        deleted += 1;
+        // The in-memory vector index doesn't auto-react to ON DELETE CASCADE
+        // on the SQLite side, so mirror the removal explicitly.
+        store.vectors.delete(c.id);
+        vectorsDeleted += 1;
+      }
     }
-  }
+  });
 
   return {
     options,

@@ -1,17 +1,11 @@
 export { buildProgram, main } from './cli.js';
+export { openStore, withStore, runAndClose, type RefmeshStore } from './db/store.js';
 export {
-  openDb,
-  openHybridStores,
-  type RefmeshDb,
-  type RefmeshHybridStores,
-} from './db/connection.js';
-export {
-  openVectorStore,
-  type VectorStore,
+  VectorIndex,
   type VectorRecord,
   type VectorQueryHit,
   type VectorQueryOptions,
-} from './db/vector-store.js';
+} from './db/vector-index.js';
 export {
   embed,
   embedBatch,
@@ -44,6 +38,8 @@ export {
   DEFAULT_SEARCH_THRESHOLD,
   DEFAULT_HALF_LIFE_DAYS,
   DEFAULT_DEMOTE_DEPRECATED,
+  DEFAULT_LEXICAL_WEIGHT,
+  DEFAULT_BM25_WEIGHT,
   type SearchOptions,
   type SearchResult,
   type SearchConceptNode,

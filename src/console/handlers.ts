@@ -8,13 +8,13 @@ import {
   executeSearch,
   executeSearchWithTrace,
 } from '../commands/search.js';
-import type { KuzuConnection, RefmeshHybridStores } from '../db/connection.js';
-import { cypherIdListLiteral } from '../db/cypher.js';
 import {
   ALL_EDGE_TYPE_NAMES,
-  INTERNAL_DESCRIBES_EDGE,
   PUBLIC_EDGE_TYPE_NAMES,
-} from '../schema/edge-types.js';
+  referencesByConceptIds,
+} from '../db/concept-repo.js';
+import { edgesForFrontier } from '../db/graph.js';
+import type { RefmeshStore } from '../db/store.js';
 import { RefmeshValidationError } from '../util/errors.js';
 
 export interface StatsResponse {
@@ -111,94 +111,88 @@ async function pathSize(path: string): Promise<number> {
   }
 }
 
-async function queryAll(
-  conn: KuzuConnection,
-  stmt: string,
-  params: Record<string, unknown> = {},
-): Promise<Record<string, unknown>[]> {
-  if (Object.keys(params).length === 0) {
-    const res = await conn.query(stmt);
-    return res.getAll();
-  }
-  const prepared = await conn.prepare(stmt);
-  const res = await conn.execute(prepared, params);
-  return res.getAll();
+function asIso(value: string | null): string | null {
+  if (!value) return null;
+  return value;
 }
 
-function asIsoString(value: unknown): string | null {
-  if (value instanceof Date) return value.toISOString();
-  // Future-proof: if Kùzu ever returns timestamps as ISO strings, pass them
-  // through verbatim instead of silently dropping the value.
-  if (typeof value === 'string' && value.length > 0) return value;
-  return null;
-}
-
-function rowToConceptItem(row: Record<string, unknown>): ConceptListItem {
-  const archivedAt = row['archivedAt'] instanceof Date ? (row['archivedAt'] as Date) : null;
-  const archiveReasonRaw = row['archiveReason'];
+function rowToConceptItem(row: ConceptItemRow): ConceptListItem {
   return {
-    id: String(row['id'] ?? ''),
-    description: String(row['description'] ?? ''),
-    details: row['details'] == null || row['details'] === '' ? null : String(row['details']),
-    firstSeenAt: asIsoString(row['firstSeenAt']),
-    lastSeenAt: asIsoString(row['lastSeenAt']),
-    touchCount: Number(row['touchCount'] ?? 0),
-    accessCount: Number(row['accessCount'] ?? 0),
-    archived: archivedAt !== null,
-    archivedAt: archivedAt ? archivedAt.toISOString() : null,
-    archiveReason:
-      archiveReasonRaw == null || archiveReasonRaw === '' ? null : String(archiveReasonRaw),
+    id: row.id,
+    description: row.description,
+    details: row.details && row.details.length > 0 ? row.details : null,
+    firstSeenAt: asIso(row.first_seen_at),
+    lastSeenAt: asIso(row.last_seen_at),
+    touchCount: row.touch_count,
+    accessCount: row.access_count,
+    archived: row.archived_at !== null,
+    archivedAt: row.archived_at,
+    archiveReason: row.archive_reason && row.archive_reason.length > 0 ? row.archive_reason : null,
   };
 }
 
-export async function getStats(stores: RefmeshHybridStores): Promise<StatsResponse> {
-  const conn = stores.graph.connection;
+interface ConceptItemRow {
+  id: string;
+  description: string;
+  details: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  touch_count: number;
+  access_count: number;
+  archived_at: string | null;
+  archive_reason: string | null;
+}
 
-  const [conceptsRow] = await queryAll(conn, 'MATCH (c:Concept) RETURN count(c) AS n');
-  const conceptsTotal = Number(conceptsRow?.['n'] ?? 0);
+export async function getStats(store: RefmeshStore): Promise<StatsResponse> {
+  const conceptsRow = store.db.prepare('SELECT COUNT(*) AS n FROM concepts').get() as {
+    n: number;
+  };
+  const archivedRow = store.db
+    .prepare('SELECT COUNT(*) AS n FROM concepts WHERE archived_at IS NOT NULL')
+    .get() as { n: number };
+  const refsRow = store.db.prepare('SELECT COUNT(*) AS n FROM refs').get() as { n: number };
 
-  const [archivedRow] = await queryAll(
-    conn,
-    'MATCH (c:Concept) WHERE c.archivedAt IS NOT NULL RETURN count(c) AS n',
-  );
-  const archivedTotal = Number(archivedRow?.['n'] ?? 0);
-
-  const [refsRow] = await queryAll(conn, 'MATCH (r:Reference) RETURN count(r) AS n');
-  const referencesTotal = Number(refsRow?.['n'] ?? 0);
-
-  const edgeCounts = await Promise.all(
-    ALL_EDGE_TYPE_NAMES.map(async (edgeType) => {
-      const [row] = await queryAll(conn, `MATCH ()-[e:${edgeType}]->() RETURN count(e) AS n`);
-      return [edgeType, Number(row?.['n'] ?? 0)] as const;
-    }),
-  );
   const edgesByType: Record<string, number> = {};
   let edgesTotal = 0;
-  for (const [edgeType, n] of edgeCounts) {
-    edgesByType[edgeType] = n;
+  const stmtEdgeCount = store.db.prepare<[string]>(
+    'SELECT COUNT(*) AS n FROM edges WHERE edge_type = ?',
+  );
+  for (const t of ALL_EDGE_TYPE_NAMES) {
+    if (t === 'DESCRIBES') {
+      const dRow = store.db.prepare('SELECT COUNT(*) AS n FROM describes').get() as {
+        n: number;
+      };
+      edgesByType[t] = dRow.n;
+      edgesTotal += dRow.n;
+      continue;
+    }
+    const row = stmtEdgeCount.get(t) as { n: number } | undefined;
+    const n = row?.n ?? 0;
+    edgesByType[t] = n;
     edgesTotal += n;
   }
 
-  const [latestRow] = await queryAll(conn, 'MATCH (c:Concept) RETURN max(c.lastSeenAt) AS latest');
-  const latest = latestRow?.['latest'] instanceof Date ? (latestRow['latest'] as Date) : null;
+  const latestRow = store.db.prepare('SELECT MAX(last_seen_at) AS latest FROM concepts').get() as {
+    latest: string | null;
+  };
 
-  const vectorCount = await stores.vector.countAll();
-  const [graphSize, vectorSize] = await Promise.all([
-    pathSize(stores.graph.path),
-    pathSize(stores.vector.path),
-  ]);
+  const dbSize = await pathSize(store.path);
+  // Vector storage now lives inside the same SQLite file. Surface row count
+  // and re-use the DB file size so the Overview tab still has both numbers
+  // even though there is no separate vector store directory anymore.
+  const vectorCount = store.vectors.countAll();
 
   return {
-    graph: { path: stores.graph.path, sizeBytes: graphSize },
-    vector: { path: stores.vector.path, sizeBytes: vectorSize, rowCount: vectorCount },
+    graph: { path: store.path, sizeBytes: dbSize },
+    vector: { path: store.path, sizeBytes: dbSize, rowCount: vectorCount },
     counts: {
-      concepts: conceptsTotal,
-      archivedConcepts: archivedTotal,
-      references: referencesTotal,
+      concepts: conceptsRow.n,
+      archivedConcepts: archivedRow.n,
+      references: refsRow.n,
       edgesTotal,
       edgesByType,
     },
-    lastSeenAt: latest ? latest.toISOString() : null,
+    lastSeenAt: latestRow.latest,
   };
 }
 
@@ -246,32 +240,32 @@ export function parseListConceptsOptions(query: URLSearchParams): ListConceptsOp
 }
 
 export async function listConcepts(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   options: ListConceptsOptions,
 ): Promise<ConceptListResponse> {
-  const conn = stores.graph.connection;
-  const where = options.includeArchived ? '' : 'WHERE c.archivedAt IS NULL';
+  const where = options.includeArchived ? '' : 'WHERE archived_at IS NULL';
 
-  const [totalRow] = await queryAll(conn, `MATCH (c:Concept) ${where} RETURN count(c) AS n`);
-  const total = Number(totalRow?.['n'] ?? 0);
+  const totalRow = store.db.prepare(`SELECT COUNT(*) AS n FROM concepts ${where}`).get() as {
+    n: number;
+  };
+  const total = totalRow.n;
 
   const orderClause =
     options.sort === 'touchCount'
-      ? 'ORDER BY c.touchCount DESC, c.id ASC'
+      ? 'ORDER BY touch_count DESC, id ASC'
       : options.sort === 'id'
-        ? 'ORDER BY c.id ASC'
-        : 'ORDER BY c.lastSeenAt DESC, c.id ASC';
+        ? 'ORDER BY id ASC'
+        : 'ORDER BY last_seen_at DESC, id ASC';
 
-  const rows = await queryAll(
-    conn,
-    `MATCH (c:Concept) ${where}
-     RETURN c.id AS id, c.description AS description, c.details AS details,
-            c.firstSeenAt AS firstSeenAt, c.lastSeenAt AS lastSeenAt,
-            c.touchCount AS touchCount, c.accessCount AS accessCount,
-            c.archivedAt AS archivedAt, c.archiveReason AS archiveReason
-     ${orderClause}
-     SKIP ${options.offset} LIMIT ${options.limit}`,
-  );
+  const rows = store.db
+    .prepare<[number, number]>(
+      `SELECT id, description, details, first_seen_at, last_seen_at,
+              touch_count, access_count, archived_at, archive_reason
+         FROM concepts ${where}
+         ${orderClause}
+         LIMIT ? OFFSET ?`,
+    )
+    .all(options.limit, options.offset) as ConceptItemRow[];
 
   return {
     total,
@@ -282,36 +276,32 @@ export async function listConcepts(
 }
 
 export async function getConcept(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   id: string,
 ): Promise<ConceptDetailResponse | null> {
   if (id.length === 0) {
     throw new RefmeshValidationError('concept id must not be empty.');
   }
-  const conn = stores.graph.connection;
-  const rows = await queryAll(
-    conn,
-    `MATCH (c:Concept) WHERE c.id = $id
-     RETURN c.id AS id, c.description AS description, c.details AS details,
-            c.firstSeenAt AS firstSeenAt, c.lastSeenAt AS lastSeenAt,
-            c.touchCount AS touchCount, c.accessCount AS accessCount,
-            c.archivedAt AS archivedAt, c.archiveReason AS archiveReason`,
-    { id },
-  );
-  const row = rows[0];
+  const row = store.db
+    .prepare<[string]>(
+      `SELECT id, description, details, first_seen_at, last_seen_at,
+              touch_count, access_count, archived_at, archive_reason
+         FROM concepts WHERE id = ?`,
+    )
+    .get(id) as ConceptItemRow | undefined;
   if (!row) return null;
 
-  const refs = await queryAll(
-    conn,
-    `MATCH (r:Reference)-[:${INTERNAL_DESCRIBES_EDGE}]->(c:Concept)
-     WHERE c.id = $id
-     RETURN r.url AS url, r.title AS title`,
-    { id },
-  );
+  const refs = store.db
+    .prepare<[string]>(
+      `SELECT r.url AS url, r.title AS title
+         FROM refs r JOIN describes d ON d.ref_url = r.url
+        WHERE d.concept_id = ?`,
+    )
+    .all(id) as Array<{ url: string; title: string }>;
 
   return {
     ...rowToConceptItem(row),
-    references: refs.map((r) => ({ url: String(r['url'] ?? ''), title: String(r['title'] ?? '') })),
+    references: refs,
   };
 }
 
@@ -352,80 +342,45 @@ interface MinimalConceptRow {
   archived: boolean;
 }
 
-async function bulkMinimalConcepts(
-  conn: KuzuConnection,
+function bulkMinimalConcepts(
+  store: RefmeshStore,
   ids: readonly string[],
-): Promise<Map<string, MinimalConceptRow>> {
+): Map<string, MinimalConceptRow> {
   const result = new Map<string, MinimalConceptRow>();
   if (ids.length === 0) return result;
-  const rows = await queryAll(
-    conn,
-    `MATCH (c:Concept) WHERE c.id IN ${cypherIdListLiteral(ids)}
-     RETURN c.id AS id, c.description AS description, c.details AS details,
-            c.archivedAt AS archivedAt`,
-  );
-  for (const row of rows) {
-    const id = String(row['id'] ?? '');
-    result.set(id, {
-      id,
-      description: String(row['description'] ?? ''),
-      details: row['details'] == null || row['details'] === '' ? null : String(row['details']),
-      archived: row['archivedAt'] instanceof Date,
+  const placeholders = ids.map(() => '?').join(', ');
+  const rows = store.db
+    .prepare<string[]>(
+      `SELECT id, description, details, archived_at
+         FROM concepts WHERE id IN (${placeholders})`,
+    )
+    .all(...ids) as Array<{
+    id: string;
+    description: string;
+    details: string | null;
+    archived_at: string | null;
+  }>;
+  for (const r of rows) {
+    result.set(r.id, {
+      id: r.id,
+      description: r.description,
+      details: r.details && r.details.length > 0 ? r.details : null,
+      archived: r.archived_at !== null,
     });
   }
   return result;
 }
 
-async function bulkEdgesForFrontier(
-  conn: KuzuConnection,
-  edgeType: string,
-  ids: readonly string[],
-): Promise<NeighborEdge[]> {
-  if (ids.length === 0) return [];
-  const inList = cypherIdListLiteral(ids);
-  const rows = await queryAll(
-    conn,
-    `MATCH (a:Concept)-[e:${edgeType}]->(b:Concept)
-     WHERE a.id IN ${inList} OR b.id IN ${inList}
-     RETURN a.id AS source, b.id AS target, e.reason AS reason`,
-  );
-  return rows.map((row) => ({
-    source: String(row['source']),
-    target: String(row['target']),
-    type: edgeType,
-    reason: row['reason'] == null ? null : String(row['reason']),
-  }));
-}
-
-async function bulkReferencesForConcepts(
-  conn: KuzuConnection,
-  ids: readonly string[],
-): Promise<{ url: string; title: string; conceptId: string }[]> {
-  if (ids.length === 0) return [];
-  const rows = await queryAll(
-    conn,
-    `MATCH (r:Reference)-[:${INTERNAL_DESCRIBES_EDGE}]->(c:Concept)
-     WHERE c.id IN ${cypherIdListLiteral(ids)}
-     RETURN r.url AS url, r.title AS title, c.id AS conceptId`,
-  );
-  return rows.map((row) => ({
-    url: String(row['url'] ?? ''),
-    title: String(row['title'] ?? ''),
-    conceptId: String(row['conceptId'] ?? ''),
-  }));
-}
-
 export async function getNeighbors(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   id: string,
   options: NeighborsOptions,
 ): Promise<NeighborsResponse | null> {
   if (id.length === 0) {
     throw new RefmeshValidationError('concept id must not be empty.');
   }
-  const conn = stores.graph.connection;
 
-  const rootMap = await bulkMinimalConcepts(conn, [id]);
+  const rootMap = bulkMinimalConcepts(store, [id]);
   const root = rootMap.get(id);
   if (!root) return null;
 
@@ -439,23 +394,23 @@ export async function getNeighbors(
   for (let level = 0; level < options.depth; level += 1) {
     if (frontier.length === 0) break;
 
-    // One query per public edge type for the entire frontier (out + in
-    // collapsed into a single OR), instead of frontier × type × direction.
-    const edgeBatches = await Promise.all(
-      PUBLIC_EDGE_TYPE_NAMES.map((edgeType) => bulkEdgesForFrontier(conn, edgeType, frontier)),
-    );
-    const newIds = new Set<string>();
     const collected: NeighborEdge[] = [];
-    for (const batch of edgeBatches) {
-      for (const edge of batch) {
-        collected.push(edge);
-        if (!nodes.has(edge.source)) newIds.add(edge.source);
-        if (!nodes.has(edge.target)) newIds.add(edge.target);
+    const newIds = new Set<string>();
+    for (const edgeType of PUBLIC_EDGE_TYPE_NAMES) {
+      const batch = edgesForFrontier(store.db, edgeType, frontier);
+      for (const e of batch) {
+        collected.push({
+          source: e.source,
+          target: e.target,
+          type: e.type,
+          reason: e.reason,
+        });
+        if (!nodes.has(e.source)) newIds.add(e.source);
+        if (!nodes.has(e.target)) newIds.add(e.target);
       }
     }
 
-    // Single batched fetch for the new endpoints' minimal info.
-    const minimalMap = await bulkMinimalConcepts(conn, [...newIds]);
+    const minimalMap = bulkMinimalConcepts(store, [...newIds]);
     const next: string[] = [];
     for (const [nid, minimal] of minimalMap) {
       if (!options.includeArchived && minimal.archived) continue;
@@ -474,7 +429,7 @@ export async function getNeighbors(
     frontier = next;
   }
 
-  const refRows = await bulkReferencesForConcepts(conn, [...nodes.keys()]);
+  const refRows = referencesByConceptIds(store.db, [...nodes.keys()]);
   const references: { url: string; title: string; conceptId: string }[] = [];
   const refKeys = new Set<string>();
   for (const ref of refRows) {
@@ -505,6 +460,7 @@ export interface ConsoleSearchOptions {
   demoteDeprecated?: number;
   reinforcementWeight?: number;
   lexicalWeight?: number;
+  bm25Weight?: number;
 }
 
 export const DEFAULT_CONSOLE_SEARCH_LIMIT = 10;
@@ -584,6 +540,7 @@ export function parseConsoleSearchOptions(query: URLSearchParams): ConsoleSearch
   const demoteDeprecated = parseOptionalUnitFloat(query, 'demoteDeprecated');
   const reinforcementWeight = parseOptionalUnitFloat(query, 'reinforcementWeight');
   const lexicalWeight = parseOptionalUnitFloat(query, 'lexicalWeight');
+  const bm25Weight = parseOptionalUnitFloat(query, 'bm25Weight');
 
   return {
     query: q,
@@ -597,6 +554,7 @@ export function parseConsoleSearchOptions(query: URLSearchParams): ConsoleSearch
     demoteDeprecated,
     reinforcementWeight,
     lexicalWeight,
+    bm25Weight,
   };
 }
 
@@ -605,7 +563,7 @@ export function parseConsoleSearchOptions(query: URLSearchParams): ConsoleSearch
 // caller adds the newer scoring params to the URL. This preserves the
 // "/api/search 挙動も payload も変更しない" guarantee.
 export async function runConsoleSearch(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   options: ConsoleSearchOptions,
 ): Promise<SearchResult> {
   const searchOptions: SearchOptions = {
@@ -616,7 +574,7 @@ export async function runConsoleSearch(
     format: 'json',
     readOnly: true,
   };
-  return await executeSearch(stores, options.query, searchOptions);
+  return await executeSearch(store, options.query, searchOptions);
 }
 
 export interface ConsoleSearchDebugResponse {
@@ -625,9 +583,10 @@ export interface ConsoleSearchDebugResponse {
 }
 
 // /api/search/debug accepts the full scoring matrix so users can iterate on
-// freshness / reinforcement / demote weights without leaving the dashboard.
+// freshness / reinforcement / demote / lexical / bm25 weights without
+// leaving the dashboard.
 export async function runConsoleSearchDebug(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   options: ConsoleSearchOptions,
 ): Promise<ConsoleSearchDebugResponse> {
   const searchOptions: SearchOptions = {
@@ -641,8 +600,9 @@ export async function runConsoleSearchDebug(
     demoteDeprecated: options.demoteDeprecated,
     reinforcementWeight: options.reinforcementWeight,
     lexicalWeight: options.lexicalWeight,
+    bm25Weight: options.bm25Weight,
     format: 'json',
     readOnly: true,
   };
-  return await executeSearchWithTrace(stores, options.query, searchOptions);
+  return await executeSearchWithTrace(store, options.query, searchOptions);
 }

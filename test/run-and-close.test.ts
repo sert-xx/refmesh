@@ -1,38 +1,43 @@
 import { describe, expect, it, vi } from 'vitest';
-import { type RefmeshHybridStores, runAndClose } from '../src/db/connection.js';
+import { type RefmeshStore, runAndClose } from '../src/db/store.js';
 
-function fakeStores(closeImpl?: () => Promise<void> | void): {
-  stores: RefmeshHybridStores;
+function fakeStore(closeImpl?: () => void | Promise<void>): {
+  store: RefmeshStore;
   closeSpy: ReturnType<typeof vi.fn>;
 } {
   const closeSpy = vi.fn(async () => {
     if (closeImpl) await closeImpl();
   });
-  // Only the `close` method is exercised by runAndClose; the rest is unused.
-  const stores = {
-    graph: {} as RefmeshHybridStores['graph'],
-    vector: {} as RefmeshHybridStores['vector'],
-    close: closeSpy,
-  } satisfies RefmeshHybridStores;
-  return { stores, closeSpy };
+  // Only `close` is exercised by runAndClose; everything else is left as
+  // type-cast empty objects to avoid pulling in real SQLite for these unit
+  // tests.
+  const store = {
+    path: '',
+    db: {} as RefmeshStore['db'],
+    statements: {} as RefmeshStore['statements'],
+    vectors: {} as RefmeshStore['vectors'],
+    transaction: <T>(fn: () => T) => fn(),
+    close: closeSpy as unknown as () => void,
+  } satisfies RefmeshStore;
+  return { store, closeSpy };
 }
 
 describe('runAndClose', () => {
-  it('returns fn result and closes stores on success', async () => {
-    const { stores, closeSpy } = fakeStores();
-    const result = await runAndClose(stores, async (s) => {
-      expect(s).toBe(stores);
+  it('returns fn result and closes the store on success', async () => {
+    const { store, closeSpy } = fakeStore();
+    const result = await runAndClose(store, async (s) => {
+      expect(s).toBe(store);
       return 42;
     });
     expect(result).toBe(42);
     expect(closeSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('closes stores even when fn throws and re-throws the original error', async () => {
-    const { stores, closeSpy } = fakeStores();
+  it('closes the store even when fn throws and re-throws the original error', async () => {
+    const { store, closeSpy } = fakeStore();
     const boom = new Error('boom');
     await expect(
-      runAndClose(stores, async () => {
+      runAndClose(store, async () => {
         throw boom;
       }),
     ).rejects.toBe(boom);
@@ -40,21 +45,21 @@ describe('runAndClose', () => {
   });
 
   it('swallows close failures on the success path so they do not mask fn result', async () => {
-    const { stores, closeSpy } = fakeStores(() => {
+    const { store, closeSpy } = fakeStore(() => {
       throw new Error('close failed');
     });
-    const result = await runAndClose(stores, async () => 'ok');
+    const result = await runAndClose(store, async () => 'ok');
     expect(result).toBe('ok');
     expect(closeSpy).toHaveBeenCalledTimes(1);
   });
 
   it('swallows close failures on the error path so the original error is preserved', async () => {
-    const { stores, closeSpy } = fakeStores(() => {
+    const { store, closeSpy } = fakeStore(() => {
       throw new Error('close failed');
     });
     const original = new Error('original');
     await expect(
-      runAndClose(stores, async () => {
+      runAndClose(store, async () => {
         throw original;
       }),
     ).rejects.toBe(original);
@@ -63,11 +68,11 @@ describe('runAndClose', () => {
 
   it('awaits close before resolving', async () => {
     let closed = false;
-    const { stores } = fakeStores(async () => {
+    const { store } = fakeStore(async () => {
       await new Promise((r) => setTimeout(r, 5));
       closed = true;
     });
-    await runAndClose(stores, async () => 1);
+    await runAndClose(store, async () => 1);
     expect(closed).toBe(true);
   });
 });

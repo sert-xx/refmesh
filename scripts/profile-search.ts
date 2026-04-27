@@ -1,10 +1,11 @@
 // Run with: npx tsx scripts/profile-search.ts
 //
-// Measures the three search phases independently so we can tell whether the
+// Measures the search phases independently so we can tell whether the
 // felt-slowness is dominated by:
 //   1) embedding generation (Node WASM ONNX runtime),
-//   2) LanceDB vector search (Rust native), or
-//   3) Kùzu post-processing (per-hit fetches + traversal + references).
+//   2) in-memory vector search (Float32Array dot products),
+//   3) FTS5 BM25 retrieval (SQLite virtual table), or
+//   4) SQLite post-processing (bulk fetches + traversal + references).
 //
 // Uses an isolated tempdir DB so it does not touch the user's ~/.refmesh data.
 
@@ -13,7 +14,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { executeRegister, parseAndValidate } from '../src/commands/register.js';
 import { executeSearch } from '../src/commands/search.js';
-import { openHybridStores } from '../src/db/connection.js';
+import { ftsSearch } from '../src/db/fts.js';
+import { openStore } from '../src/db/store.js';
 import { embed } from '../src/embedding/embedder.js';
 
 const QUERIES: readonly string[] = [
@@ -51,8 +53,16 @@ interface ConceptSpec {
 }
 
 const REACT_CONCEPTS: ConceptSpec[] = [
-  { id: 'useState', description: 'React で状態を持たせるフック', details: 'const [v, setV] = useState(initial);' },
-  { id: 'useEffect', description: '副作用を実行するフック', details: '依存配列により再実行を制御する' },
+  {
+    id: 'useState',
+    description: 'React で状態を持たせるフック',
+    details: 'const [v, setV] = useState(initial);',
+  },
+  {
+    id: 'useEffect',
+    description: '副作用を実行するフック',
+    details: '依存配列により再実行を制御する',
+  },
   { id: 'useMemo', description: '計算結果をメモ化するフック' },
   { id: 'useCallback', description: '関数参照をメモ化するフック' },
   { id: 'useRef', description: 'DOM 参照や可変値を保持するフック' },
@@ -61,7 +71,10 @@ const REACT_CONCEPTS: ConceptSpec[] = [
   { id: 'Server Components', description: 'サーバ側でレンダリングされる React コンポーネント' },
   { id: 'Client Components', description: 'ブラウザで実行される React コンポーネント' },
   { id: 'Suspense', description: '非同期境界を宣言するコンポーネント' },
-  { id: 'React Hooks', description: 'React の関数コンポーネントで状態やライフサイクルを扱う仕組み' },
+  {
+    id: 'React Hooks',
+    description: 'React の関数コンポーネントで状態やライフサイクルを扱う仕組み',
+  },
   { id: 'Concurrent Rendering', description: '優先度ベースのレンダリングモデル' },
   { id: 'React 19', description: 'React の最新メジャーバージョン' },
 ];
@@ -77,25 +90,31 @@ const RELS: { source: string; target: string; type: string; reason: string }[] =
   { source: 'useMemo', target: 'useCallback', type: 'RELATED_TO', reason: 'memoization siblings' },
   { source: 'Server Components', target: 'React 19', type: 'PART_OF', reason: 'shipped feature' },
   { source: 'Client Components', target: 'React 19', type: 'PART_OF', reason: 'shipped feature' },
-  { source: 'Server Components', target: 'Client Components', type: 'ALTERNATIVE_TO', reason: 'execution boundary' },
-  { source: 'Suspense', target: 'Concurrent Rendering', type: 'DEPENDS_ON', reason: 'requires concurrent renderer' },
+  {
+    source: 'Server Components',
+    target: 'Client Components',
+    type: 'ALTERNATIVE_TO',
+    reason: 'execution boundary',
+  },
+  {
+    source: 'Suspense',
+    target: 'Concurrent Rendering',
+    type: 'DEPENDS_ON',
+    reason: 'requires concurrent renderer',
+  },
   { source: 'Concurrent Rendering', target: 'React 19', type: 'PART_OF', reason: 'shipped feature' },
 ];
 
 async function main(): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'refmesh-profile-'));
-  const stores = await openHybridStores({
-    graphPath: join(dir, 'graph.kuzu'),
-    vectorPath: join(dir, 'vectors.lance'),
-  });
+  const store = openStore({ dbPath: join(dir, 'refmesh.db') });
 
   try {
     console.log(`tempdir: ${dir}`);
 
-    // --- Setup -----------------------------------------------------------
     const setupStart = process.hrtime.bigint();
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         JSON.stringify({
           reference: { url: 'https://react.dev/reference/react', title: 'React Reference' },
@@ -105,77 +124,75 @@ async function main(): Promise<void> {
       ),
     );
     const setupMs = ms(process.hrtime.bigint() - setupStart);
-    console.log(`registered ${REACT_CONCEPTS.length} concepts + ${RELS.length} edges in ${setupMs.toFixed(0)}ms`);
+    console.log(
+      `registered ${REACT_CONCEPTS.length} concepts + ${RELS.length} edges in ${setupMs.toFixed(0)}ms`,
+    );
 
-    // --- Warm up the embedding model (first call loads ~80MB) ------------
     const warmStart = process.hrtime.bigint();
     await embed('warmup');
     const warmMs = ms(process.hrtime.bigint() - warmStart);
     console.log(`embedding model warmup: ${warmMs.toFixed(0)}ms (cold load)`);
     console.log('');
 
-    // --- Per-phase timing ------------------------------------------------
     const embedTimes: number[] = [];
     const vectorTimes: number[] = [];
+    const ftsTimes: number[] = [];
     const totalTimes: number[] = [];
     const postTimes: number[] = [];
 
     for (let i = 0; i < ITERATIONS; i += 1) {
       for (const q of QUERIES) {
-        // (1) embedding only
         const e0 = process.hrtime.bigint();
         const vec = await embed(q);
         const eMs = ms(process.hrtime.bigint() - e0);
         embedTimes.push(eMs);
 
-        // (2) vector search alone
         const v0 = process.hrtime.bigint();
-        await stores.vector.queryByVector(vec, { limit: 5, threshold: 0 });
+        store.vectors.query(vec, { limit: 5, threshold: 0 });
         const vMs = ms(process.hrtime.bigint() - v0);
         vectorTimes.push(vMs);
 
-        // (3) full executeSearch (embed + vector + Kùzu post + reinforcement)
+        const f0 = process.hrtime.bigint();
+        ftsSearch(store.db, q, { limit: 5 });
+        const fMs = ms(process.hrtime.bigint() - f0);
+        ftsTimes.push(fMs);
+
         const s0 = process.hrtime.bigint();
-        await executeSearch(stores, q, {
+        await executeSearch(store, q, {
           depth: 1,
           limit: 5,
           threshold: 0,
           format: 'json',
-          readOnly: true, // skip the accessCount UPDATE so timing reflects reads
+          readOnly: true,
         });
         const sMs = ms(process.hrtime.bigint() - s0);
         totalTimes.push(sMs);
 
-        // Post-processing isolated by subtraction (informative, not exact —
-        // executeSearch internally calls embed and queryByVector again).
-        postTimes.push(sMs - eMs - vMs);
+        postTimes.push(sMs - eMs - vMs - fMs);
       }
     }
 
     console.log('--- per-phase timings (5 queries × 5 iterations = 25 samples each) ---');
     console.log(summary('embed(query)', embedTimes));
-    console.log(summary('vector queryByVector', vectorTimes));
+    console.log(summary('vector query', vectorTimes));
+    console.log(summary('fts5 query', ftsTimes));
     console.log(summary('executeSearch (total)', totalTimes));
-    console.log(summary('Kùzu post (total - e - v)', postTimes));
+    console.log(summary('SQLite post (total - e - v - f)', postTimes));
     console.log('');
     const eMed = median(embedTimes);
     const vMed = median(vectorTimes);
+    const fMed = median(ftsTimes);
     const tMed = median(totalTimes);
     const pMed = median(postTimes);
     const denom = tMed > 0 ? tMed : 1;
     console.log('--- contribution to executeSearch median ---');
-    console.log(
-      `embed:      ${eMed.toFixed(1)}ms  (${((eMed / denom) * 100).toFixed(1)}%)`,
-    );
-    console.log(
-      `vector:     ${vMed.toFixed(1)}ms  (${((vMed / denom) * 100).toFixed(1)}%)`,
-    );
-    console.log(
-      `Kùzu post:  ${pMed.toFixed(1)}ms  (${((pMed / denom) * 100).toFixed(1)}%)`,
-    );
+    console.log(`embed:        ${eMed.toFixed(1)}ms  (${((eMed / denom) * 100).toFixed(1)}%)`);
+    console.log(`vector:       ${vMed.toFixed(1)}ms  (${((vMed / denom) * 100).toFixed(1)}%)`);
+    console.log(`fts5:         ${fMed.toFixed(1)}ms  (${((fMed / denom) * 100).toFixed(1)}%)`);
+    console.log(`SQLite post:  ${pMed.toFixed(1)}ms  (${((pMed / denom) * 100).toFixed(1)}%)`);
   } finally {
     try {
-      await stores.close();
+      store.close();
     } catch {
       /* ignore */
     }
