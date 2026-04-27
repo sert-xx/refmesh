@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { executeRegister, parseAndValidate } from '../src/commands/register.js';
-import { type RefmeshHybridStores, openHybridStores } from '../src/db/connection.js';
+import { type RefmeshStore, openStore } from '../src/db/store.js';
 import { RefmeshValidationError } from '../src/util/errors.js';
 
 function payload(refOverrides: Record<string, unknown>) {
@@ -14,42 +14,51 @@ function payload(refOverrides: Record<string, unknown>) {
   });
 }
 
-async function getConcept(stores: RefmeshHybridStores, id: string) {
-  const res = await stores.graph.connection.prepare(
-    `MATCH (c:Concept) WHERE c.id = $id
-     RETURN c.firstSeenAt AS firstSeenAt, c.lastSeenAt AS lastSeenAt,
-            c.touchCount AS touchCount, c.accessCount AS accessCount,
-            c.archivedAt AS archivedAt`,
-  );
-  const rows = await (await stores.graph.connection.execute(res, { id })).getAll();
-  return rows[0] as Record<string, unknown> | undefined;
+interface ConceptMetaRow {
+  first_seen_at: string;
+  last_seen_at: string;
+  touch_count: number;
+  access_count: number;
+  archived_at: string | null;
 }
 
-async function getReference(stores: RefmeshHybridStores, url: string) {
-  const res = await stores.graph.connection.prepare(
-    `MATCH (r:Reference) WHERE r.url = $url
-     RETURN r.firstSeenAt AS firstSeenAt, r.lastSeenAt AS lastSeenAt,
-            r.publishedAt AS publishedAt, r.fetchedAt AS fetchedAt`,
-  );
-  const rows = await (await stores.graph.connection.execute(res, { url })).getAll();
-  return rows[0] as Record<string, unknown> | undefined;
+interface RefMetaRow {
+  first_seen_at: string;
+  last_seen_at: string;
+  published_at: string | null;
+  fetched_at: string | null;
+}
+
+function getConcept(store: RefmeshStore, id: string): ConceptMetaRow | undefined {
+  return store.db
+    .prepare<[string]>(
+      `SELECT first_seen_at, last_seen_at, touch_count, access_count, archived_at
+         FROM concepts WHERE id = ?`,
+    )
+    .get(id) as ConceptMetaRow | undefined;
+}
+
+function getReference(store: RefmeshStore, url: string): RefMetaRow | undefined {
+  return store.db
+    .prepare<[string]>(
+      `SELECT first_seen_at, last_seen_at, published_at, fetched_at
+         FROM refs WHERE url = ?`,
+    )
+    .get(url) as RefMetaRow | undefined;
 }
 
 describe('freshness metadata (PBI-8)', () => {
   let tempDir: string;
-  let stores: RefmeshHybridStores;
+  let store: RefmeshStore;
 
-  beforeAll(async () => {
+  beforeAll(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'refmesh-fresh-'));
-    stores = await openHybridStores({
-      graphPath: join(tempDir, 'graph.kuzu'),
-      vectorPath: join(tempDir, 'vectors.lance'),
-    });
+    store = openStore({ dbPath: join(tempDir, 'refmesh.db') });
   });
 
-  afterAll(async () => {
+  afterAll(() => {
     try {
-      await stores.close();
+      store.close();
     } catch {
       // ignore
     }
@@ -60,54 +69,53 @@ describe('freshness metadata (PBI-8)', () => {
     }
   });
 
-  beforeEach(async () => {
-    await stores.graph.connection.query('MATCH (n) DETACH DELETE n');
-    await stores.vector.clearAll();
+  beforeEach(() => {
+    store.db.exec('DELETE FROM concepts; DELETE FROM refs;');
+    store.vectors.clearAll();
   });
 
   it('initializes firstSeenAt/lastSeenAt/touchCount on first register', async () => {
-    await executeRegister(stores, parseAndValidate(payload({})));
-    const c = await getConcept(stores, 'Alpha');
+    await executeRegister(store, parseAndValidate(payload({})));
+    const c = getConcept(store, 'Alpha');
     expect(c).toBeDefined();
-    expect(c!.firstSeenAt).toBeInstanceOf(Date);
-    expect(c!.lastSeenAt).toBeInstanceOf(Date);
-    expect((c!.firstSeenAt as Date).getTime()).toBe((c!.lastSeenAt as Date).getTime());
-    expect(c!.touchCount).toBe(1);
-    expect(c!.accessCount).toBe(0);
-    expect(c!.archivedAt).toBeNull();
+    expect(typeof c!.first_seen_at).toBe('string');
+    expect(typeof c!.last_seen_at).toBe('string');
+    expect(c!.first_seen_at).toBe(c!.last_seen_at);
+    expect(c!.touch_count).toBe(1);
+    expect(c!.access_count).toBe(0);
+    expect(c!.archived_at).toBeNull();
   });
 
   it('updates lastSeenAt and increments touchCount on re-register, keeping firstSeenAt', async () => {
-    await executeRegister(stores, parseAndValidate(payload({})));
-    const before = await getConcept(stores, 'Alpha');
+    await executeRegister(store, parseAndValidate(payload({})));
+    const before = getConcept(store, 'Alpha');
     await new Promise((r) => setTimeout(r, 1100));
-    await executeRegister(stores, parseAndValidate(payload({})));
-    const after = await getConcept(stores, 'Alpha');
+    await executeRegister(store, parseAndValidate(payload({})));
+    const after = getConcept(store, 'Alpha');
 
-    expect((after!.firstSeenAt as Date).getTime()).toBe((before!.firstSeenAt as Date).getTime());
-    expect((after!.lastSeenAt as Date).getTime()).toBeGreaterThanOrEqual(
-      (before!.lastSeenAt as Date).getTime(),
+    expect(after!.first_seen_at).toBe(before!.first_seen_at);
+    expect(new Date(after!.last_seen_at).getTime()).toBeGreaterThanOrEqual(
+      new Date(before!.last_seen_at).getTime(),
     );
-    expect(after!.touchCount).toBe(2);
+    expect(after!.touch_count).toBe(2);
   });
 
   it('persists reference.publishedAt when provided', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(payload({ publishedAt: '2026-01-01T00:00:00Z' })),
     );
-    const r = await getReference(stores, 'https://example.com/freshness');
-    expect(r!.publishedAt).toBeInstanceOf(Date);
-    expect((r!.publishedAt as Date).toISOString()).toBe('2026-01-01T00:00:00.000Z');
-    expect(r!.fetchedAt).toBeInstanceOf(Date);
-    expect(r!.firstSeenAt).toBeInstanceOf(Date);
+    const r = getReference(store, 'https://example.com/freshness');
+    expect(r!.published_at).toBe('2026-01-01T00:00:00.000Z');
+    expect(typeof r!.fetched_at).toBe('string');
+    expect(typeof r!.first_seen_at).toBe('string');
   });
 
   it('leaves reference.publishedAt NULL when omitted', async () => {
-    await executeRegister(stores, parseAndValidate(payload({})));
-    const r = await getReference(stores, 'https://example.com/freshness');
-    expect(r!.publishedAt).toBeNull();
-    expect(r!.fetchedAt).toBeInstanceOf(Date);
+    await executeRegister(store, parseAndValidate(payload({})));
+    const r = getReference(store, 'https://example.com/freshness');
+    expect(r!.published_at).toBeNull();
+    expect(typeof r!.fetched_at).toBe('string');
   });
 
   it('rejects invalid ISO date for publishedAt via JSON schema', () => {

@@ -77,6 +77,7 @@ interface SearchHit {
   accessCount?: number;
   demoted?: boolean;
   lexical?: number;
+  bm25?: number;
 }
 
 interface SearchResult {
@@ -109,10 +110,17 @@ interface SearchTraceCandidate {
   accessCount: number;
   reinforcement: number;
   lexical: number;
+  bm25: number;
   demoted: boolean;
   archived: boolean;
   finalScore: number;
   excluded?: 'archived' | 'maxAge' | 'demoted-zero' | 'concept-missing';
+}
+
+interface SearchTraceFtsHit {
+  id: string;
+  bm25: number;
+  rawRank: number;
 }
 
 interface SearchTraceLevel {
@@ -126,6 +134,7 @@ interface SearchTrace {
   queryTokens: string[];
   vectorRequest: { limit: number; oversample: number; threshold: number };
   vectorHits: SearchTraceVectorHit[];
+  ftsHits: SearchTraceFtsHit[];
   graphQueries: SearchTraceGraphQuery[];
   candidates: SearchTraceCandidate[];
   traversal: { depth: number; levels: SearchTraceLevel[] };
@@ -569,6 +578,7 @@ async function runSearchDebug(event?: Event): Promise<void> {
     ['demoteDeprecated', '#search-debug-demote'],
     ['reinforcementWeight', '#search-debug-reinforcement-weight'],
     ['lexicalWeight', '#search-debug-lexical-weight'],
+    ['bm25Weight', '#search-debug-bm25-weight'],
   ];
   for (const [key, selector] of optionalParams) {
     const v = readOptionalNumberValue(selector);
@@ -630,6 +640,37 @@ function renderSearchDebug(target: HTMLElement, data: SearchDebugResponse): void
         limit (oversample) = ${trace.vectorRequest.oversample} ·
         threshold = ${trace.vectorRequest.threshold}
       </div>
+    </section>
+
+    <section class="debug-section">
+      <h3>FTS5 hits (BM25, ${trace.ftsHits.length} 件)</h3>
+      ${
+        trace.ftsHits.length === 0
+          ? '<p class="muted">no fts hits</p>'
+          : `<div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>id</th>
+              <th>bm25 (normalised)</th>
+              <th>raw rank</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${trace.ftsHits
+              .map(
+                (h) => `
+                  <tr>
+                    <td class="id-cell" data-id="${escapeHtml(h.id)}">${escapeHtml(h.id)}</td>
+                    <td>${h.bm25.toFixed(4)}</td>
+                    <td>${h.rawRank.toFixed(4)}</td>
+                  </tr>`,
+              )
+              .join('')}
+          </tbody>
+        </table>
+      </div>`
+      }
     </section>
 
     <section class="debug-section">
@@ -705,6 +746,7 @@ function renderSearchDebug(target: HTMLElement, data: SearchDebugResponse): void
               <th>access</th>
               <th>reinf</th>
               <th>lexical</th>
+              <th>bm25</th>
               <th>flags</th>
               <th>final</th>
               <th>status</th>
@@ -730,6 +772,7 @@ function renderSearchDebug(target: HTMLElement, data: SearchDebugResponse): void
                     <td>${c.accessCount}</td>
                     <td>${c.reinforcement.toFixed(4)}</td>
                     <td>${c.lexical.toFixed(4)}</td>
+                    <td>${c.bm25.toFixed(4)}</td>
                     <td>${flags}</td>
                     <td>${c.finalScore.toFixed(4)}</td>
                     <td>${status}</td>

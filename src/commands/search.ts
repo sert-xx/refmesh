@@ -1,11 +1,15 @@
-import type { KuzuConnection, RefmeshHybridStores } from '../db/connection.js';
-import { cypherIdListLiteral } from '../db/cypher.js';
-import { embed } from '../embedding/embedder.js';
 import {
-  ALL_EDGE_TYPE_NAMES,
-  INTERNAL_DESCRIBES_EDGE,
-  PUBLIC_EDGE_TYPE_NAMES,
-} from '../schema/edge-types.js';
+  bulkConceptFreshness,
+  bulkConceptsByIds,
+  incrementAccessCounts,
+  referencesForConcepts,
+  visibleConceptIds,
+} from '../db/concept-repo.js';
+import { type FtsHit, ftsSearch } from '../db/fts.js';
+import { edgesForFrontier } from '../db/graph.js';
+import type { RefmeshStore } from '../db/store.js';
+import { embed } from '../embedding/embedder.js';
+import { ALL_EDGE_TYPE_NAMES, PUBLIC_EDGE_TYPE_NAMES } from '../schema/edge-types.js';
 import { RefmeshValidationError } from '../util/errors.js';
 
 export const DEFAULT_SEARCH_THRESHOLD = 0.3;
@@ -13,11 +17,13 @@ export const DEFAULT_SEARCH_LIMIT = 5;
 export const DEFAULT_SEARCH_DEPTH = 1;
 export const DEFAULT_HALF_LIFE_DAYS = 180;
 export const DEFAULT_DEMOTE_DEPRECATED = 0.5;
-// Lexical boost is treated as an independent additive axis on top of the
-// cosine/freshness/reinforcement triplet. The default 0.3 is enough to push
-// concepts whose id contains the query token above unrelated cluster-mates
-// while still letting cosine dominate when lexical signals are tied.
+// Lexical (PBI-17) and BM25 (PBI-18) are independent additive axes on top of
+// the cosine/freshness/reinforcement triplet. The defaults split the cosine
+// half evenly: cosine 0.4 / lexical 0.3 / bm25 0.3 with freshness/reinforcement
+// = 0. This pushes id-token matches above semantic-cluster mates while still
+// letting BM25 surface description-only hits.
 export const DEFAULT_LEXICAL_WEIGHT = 0.3;
+export const DEFAULT_BM25_WEIGHT = 0.3;
 
 export interface SearchOptions {
   depth: number;
@@ -29,6 +35,7 @@ export interface SearchOptions {
   demoteDeprecated?: number;
   reinforcementWeight?: number;
   lexicalWeight?: number;
+  bm25Weight?: number;
   includeArchived?: boolean;
   format: 'text' | 'json';
   // Skip side effects (e.g., reinforcement accessCount increment).
@@ -48,6 +55,7 @@ export interface SearchConceptNode {
   accessCount?: number;
   reinforcement?: number;
   lexical?: number;
+  bm25?: number;
 }
 
 export interface SearchReferenceNode {
@@ -71,28 +79,27 @@ export interface SearchResult {
 }
 
 // --- Trace types -----------------------------------------------------------
-// PBI-16 introduces a debug-only trace channel that records every observable
-// step of executeSearch so a console UI can show "how the query was actually
-// interpreted". Trace data is *only* assembled when a recorder is attached;
-// the non-trace path is byte-for-byte identical to the previous behavior.
 
 export interface SearchTraceVectorHit {
   id: string;
   text: string;
   cosine: number;
-  // Cosine distance as reported by LanceDB convention (1 - cosine_similarity)
-  // mapped back into our [0, 1] similarity space: distance = 2 * (1 - cosine).
-  // Surfaced separately so users can sanity-check threshold tuning.
+  // distance = 2 * (1 - cosine) so the trace UI keeps the same axis it had
+  // when LanceDB reported _distance directly. Pure cosmetic, but lets users
+  // re-use intuition built up before the SQLite migration.
   distance: number;
   passedThreshold: boolean;
+}
+
+export interface SearchTraceFtsHit {
+  id: string;
+  bm25: number;
+  rawRank: number;
 }
 
 export interface SearchTraceGraphQuery {
   label: string;
   cypher: string;
-  // First few inputs that were inlined into the cypher list literal, so users
-  // can correlate which ids the query actually targeted without dumping the
-  // full (potentially huge) cypher text again.
   idsPreview: string[];
 }
 
@@ -106,6 +113,7 @@ export interface SearchTraceCandidate {
   accessCount: number;
   reinforcement: number;
   lexical: number;
+  bm25: number;
   demoted: boolean;
   archived: boolean;
   finalScore: number;
@@ -125,9 +133,6 @@ export interface SearchTrace {
     preview: number[];
     full: number[];
   };
-  // Tokens derived from the raw query string by the same tokenizer that runs
-  // against id/description/details. Surfaced so users can see what actually
-  // fed the lexical scorer (e.g. "k8s_proxy" → ["k8s", "proxy"]).
   queryTokens: string[];
   vectorRequest: {
     limit: number;
@@ -135,6 +140,7 @@ export interface SearchTrace {
     threshold: number;
   };
   vectorHits: SearchTraceVectorHit[];
+  ftsHits: SearchTraceFtsHit[];
   graphQueries: SearchTraceGraphQuery[];
   candidates: SearchTraceCandidate[];
   traversal: {
@@ -148,6 +154,7 @@ class SearchTraceRecorder {
   private queryTokens: string[] = [];
   private vectorRequest: SearchTrace['vectorRequest'] | null = null;
   private vectorHits: SearchTraceVectorHit[] = [];
+  private ftsHits: SearchTraceFtsHit[] = [];
   private graphQueries: SearchTraceGraphQuery[] = [];
   private candidates: SearchTraceCandidate[] = [];
   private traversalDepth = 0;
@@ -174,6 +181,10 @@ class SearchTraceRecorder {
 
   recordVectorHits(hits: SearchTraceVectorHit[]): void {
     this.vectorHits = hits;
+  }
+
+  recordFtsHits(hits: SearchTraceFtsHit[]): void {
+    this.ftsHits = hits;
   }
 
   recordGraphQuery(q: SearchTraceGraphQuery): void {
@@ -204,6 +215,7 @@ class SearchTraceRecorder {
       queryTokens: this.queryTokens,
       vectorRequest: this.vectorRequest,
       vectorHits: this.vectorHits,
+      ftsHits: this.ftsHits,
       graphQueries: this.graphQueries,
       candidates: this.candidates,
       traversal: {
@@ -216,19 +228,15 @@ class SearchTraceRecorder {
 
 // Tokenizer shared by lexical scoring and trace surfacing. Splits on
 // whitespace plus typical id-style separators (_, -, ., :, /), then breaks
-// camelCase / PascalCase boundaries (FooBar → Foo, Bar; HTTPServer →
-// HTTP, Server) so identifiers like "GoogleKubernetesEngine" match a
-// "kubernetes" query. Lower-cased so the comparison is case-insensitive.
-// Intentionally no stopword list / stemming — short concept ids are
-// dominated by content words and stripping them creates more bugs than it
-// solves.
+// camelCase / PascalCase boundaries so identifiers like
+// "GoogleKubernetesEngine" match a "kubernetes" query. Lower-cased so the
+// comparison is case-insensitive. No stopword list / stemming — short
+// concept ids are dominated by content words.
 export function tokenize(input: string): string[] {
   if (!input) return [];
   const out: string[] = [];
   for (const piece of input.split(/[\s_\-./:]+/)) {
     if (piece.length === 0) continue;
-    // Insert a boundary at lower→Upper transitions and at runs-of-uppercase
-    // followed by Title-cased words ("HTTPServer" → "HTTP", "Server").
     const split = piece
       .replace(/([a-z0-9])([A-Z])/g, '$1\u0000$2')
       .replace(/([A-Z]+)([A-Z][a-z])/g, '$1\u0000$2')
@@ -340,10 +348,15 @@ export function validateSearchOptions(opts: SearchOptions): void {
       );
     }
   }
-  // lexicalWeight is an additive axis on top of cosine and is intentionally
-  // excluded from this constraint. The freshness/reinforcement pair already
-  // splits the cosine budget, so widening the constraint to include lexical
-  // would silently break callers that pass freshnessWeight=1.
+  if (opts.bm25Weight !== undefined) {
+    if (!Number.isFinite(opts.bm25Weight) || opts.bm25Weight < 0 || opts.bm25Weight > 1) {
+      throw new RefmeshValidationError(
+        `--bm25-weight must be a number in [0, 1] (got: ${opts.bm25Weight}).`,
+      );
+    }
+  }
+  // lexical and bm25 are additive axes on top of cosine; the existing
+  // freshness+reinforcement budget remains the only enforced sum.
   const w = opts.freshnessWeight ?? 0;
   const r = opts.reinforcementWeight ?? 0;
   if (w + r > 1 + 1e-9) {
@@ -351,145 +364,6 @@ export function validateSearchOptions(opts: SearchOptions): void {
       `--freshness-weight + --reinforcement-weight must be <= 1 (got: ${w + r}).`,
     );
   }
-}
-
-async function queryAll(
-  conn: KuzuConnection,
-  stmt: string,
-  params: Record<string, unknown> = {},
-): Promise<Record<string, unknown>[]> {
-  if (Object.keys(params).length === 0) {
-    const res = await conn.query(stmt);
-    return res.getAll();
-  }
-  const prepared = await conn.prepare(stmt);
-  const res = await conn.execute(prepared, params);
-  return res.getAll();
-}
-
-function rowToConcept(row: Record<string, unknown>): SearchConceptNode {
-  const id = String(row['id'] ?? '');
-  const description = String(row['description'] ?? '');
-  const details =
-    row['details'] == null || row['details'] === '' ? undefined : String(row['details']);
-  return { id, description, details };
-}
-
-interface ConceptFreshnessRow {
-  archivedAt: Date | null;
-  lastSeenAt: Date | null;
-  accessCount: number;
-  newestPublishedAt: Date | null;
-  isDeprecated: boolean;
-}
-
-// Bulk-load minimal concept attrs for an entire id list in one query.
-// Replaces the old per-hit fetchConceptById loop that dominated executeSearch
-// latency (PBI-13).
-async function bulkConceptsByIds(
-  conn: KuzuConnection,
-  ids: readonly string[],
-  recorder: SearchTraceRecorder | null,
-  label = 'concepts.byIds',
-): Promise<Map<string, SearchConceptNode>> {
-  const map = new Map<string, SearchConceptNode>();
-  if (ids.length === 0) return map;
-  const cypher = `MATCH (c:Concept) WHERE c.id IN ${cypherIdListLiteral(ids)}
-     RETURN c.id AS id, c.description AS description, c.details AS details`;
-  recorder?.recordGraphQuery({ label, cypher, idsPreview: idsPreview(ids) });
-  const rows = await queryAll(conn, cypher);
-  for (const r of rows) {
-    const id = String(r['id'] ?? '');
-    map.set(id, rowToConcept(r));
-  }
-  return map;
-}
-
-// Bulk-load freshness signals (archivedAt / lastSeenAt / accessCount,
-// newest publishedAt of any attached Reference, and "is deprecated" via
-// DEPRECATES/REPLACES inbound edges) for an entire id list, using only 4
-// queries that run in parallel regardless of |ids|.
-async function bulkConceptFreshness(
-  conn: KuzuConnection,
-  ids: readonly string[],
-  recorder: SearchTraceRecorder | null,
-): Promise<Map<string, ConceptFreshnessRow>> {
-  const map = new Map<string, ConceptFreshnessRow>();
-  if (ids.length === 0) return map;
-  const inList = cypherIdListLiteral(ids);
-
-  const baseCypher = `MATCH (c:Concept) WHERE c.id IN ${inList}
-       RETURN c.id AS id, c.archivedAt AS archivedAt,
-              c.lastSeenAt AS lastSeenAt, c.accessCount AS accessCount`;
-  const refCypher = `MATCH (r:Reference)-[:${INTERNAL_DESCRIBES_EDGE}]->(c:Concept)
-       WHERE c.id IN ${inList}
-       RETURN c.id AS id, r.publishedAt AS publishedAt`;
-  const deprCypher = `MATCH (other:Concept)-[:DEPRECATES]->(c:Concept)
-       WHERE c.id IN ${inList} AND other.id <> c.id
-       RETURN c.id AS id`;
-  const replCypher = `MATCH (other:Concept)-[:REPLACES]->(c:Concept)
-       WHERE c.id IN ${inList} AND other.id <> c.id
-       RETURN c.id AS id`;
-
-  if (recorder) {
-    const preview = idsPreview(ids);
-    recorder.recordGraphQuery({ label: 'freshness.base', cypher: baseCypher, idsPreview: preview });
-    recorder.recordGraphQuery({ label: 'freshness.refs', cypher: refCypher, idsPreview: preview });
-    recorder.recordGraphQuery({
-      label: 'freshness.deprecates',
-      cypher: deprCypher,
-      idsPreview: preview,
-    });
-    recorder.recordGraphQuery({
-      label: 'freshness.replaces',
-      cypher: replCypher,
-      idsPreview: preview,
-    });
-  }
-
-  const [baseRows, refRows, deprRows, replRows] = await Promise.all([
-    queryAll(conn, baseCypher),
-    queryAll(conn, refCypher),
-    queryAll(conn, deprCypher),
-    queryAll(conn, replCypher),
-  ]);
-
-  const newestByConcept = new Map<string, Date>();
-  for (const row of refRows) {
-    const id = String(row['id'] ?? '');
-    const v = row['publishedAt'];
-    if (v instanceof Date) {
-      const cur = newestByConcept.get(id);
-      if (!cur || v.getTime() > cur.getTime()) {
-        newestByConcept.set(id, v);
-      }
-    }
-  }
-
-  const deprecated = new Set<string>();
-  for (const row of deprRows) deprecated.add(String(row['id'] ?? ''));
-  for (const row of replRows) deprecated.add(String(row['id'] ?? ''));
-
-  for (const row of baseRows) {
-    const id = String(row['id'] ?? '');
-    map.set(id, {
-      archivedAt: row['archivedAt'] instanceof Date ? (row['archivedAt'] as Date) : null,
-      lastSeenAt: row['lastSeenAt'] instanceof Date ? (row['lastSeenAt'] as Date) : null,
-      accessCount: Number(row['accessCount'] ?? 0),
-      newestPublishedAt: newestByConcept.get(id) ?? null,
-      isDeprecated: deprecated.has(id),
-    });
-  }
-  return map;
-}
-
-async function incrementAccessCounts(conn: KuzuConnection, ids: string[]): Promise<void> {
-  if (ids.length === 0) return;
-  await queryAll(
-    conn,
-    `MATCH (c:Concept) WHERE c.id IN ${cypherIdListLiteral(ids)}
-     SET c.accessCount = c.accessCount + 1`,
-  );
 }
 
 function ageInDays(now: Date, anchor: Date | null): number {
@@ -503,40 +377,394 @@ function freshnessScore(ageDays: number, halfLifeDays: number): number {
   return Math.exp(-Math.LN2 * (ageDays / halfLifeDays));
 }
 
-// Single-query out+in edge fetch for a frontier slice. Replaces the inner
-// 2 × |frontier| × |edge_types| loop with one query per edge type.
-async function bulkEdgesForFrontier(
-  conn: KuzuConnection,
-  edgeType: string,
-  ids: readonly string[],
-  recorder: SearchTraceRecorder | null,
-  level: number,
-): Promise<SearchEdge[]> {
-  if (ids.length === 0) return [];
-  const inList = cypherIdListLiteral(ids);
-  const cypher = `MATCH (a:Concept)-[e:${edgeType}]->(b:Concept)
-     WHERE a.id IN ${inList} OR b.id IN ${inList}
-     RETURN a.id AS source, b.id AS target, e.reason AS reason`;
-  recorder?.recordGraphQuery({
-    label: `edges.frontier.${edgeType}.level${level}`,
-    cypher,
-    idsPreview: idsPreview(ids),
-  });
-  const rows = await queryAll(conn, cypher);
-  return rows.map((row) => ({
-    source: String(row['source']),
-    target: String(row['target']),
-    type: edgeType,
-    reason: row['reason'] == null ? undefined : String(row['reason']),
-  }));
+function parseIso(value: string | null): Date | null {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
-async function collectRelatedEdges(
-  conn: KuzuConnection,
+interface PartialCandidate extends SearchConceptNode {
+  rawCosine: number;
+  rawFreshness: number;
+  rawAccess: number;
+  rawLexical: number;
+  rawBm25: number;
+}
+
+async function executeSearchCore(
+  store: RefmeshStore,
+  query: string,
+  options: SearchOptions,
+  recorder: SearchTraceRecorder | null,
+): Promise<SearchResult> {
+  validateSearchOptions(options);
+  if (query.length === 0) {
+    throw new RefmeshValidationError('Search query must not be empty.');
+  }
+
+  const threshold = options.threshold ?? DEFAULT_SEARCH_THRESHOLD;
+  const freshnessWeight = options.freshnessWeight ?? 0;
+  const reinforcementWeight = options.reinforcementWeight ?? 0;
+  const lexicalWeight = options.lexicalWeight ?? DEFAULT_LEXICAL_WEIGHT;
+  const bm25Weight = options.bm25Weight ?? DEFAULT_BM25_WEIGHT;
+  const cosineWeight = Math.max(
+    0,
+    1 - freshnessWeight - reinforcementWeight - lexicalWeight - bm25Weight,
+  );
+  const halfLifeDays = options.halfLifeDays ?? DEFAULT_HALF_LIFE_DAYS;
+  const maxAgeDays = options.maxAgeDays;
+  const demoteDeprecated = options.demoteDeprecated ?? DEFAULT_DEMOTE_DEPRECATED;
+  const includeArchived = options.includeArchived ?? false;
+  const now = new Date();
+
+  const queryTokenList = tokenize(query);
+  const queryTokenSet: ReadonlySet<string> = new Set(queryTokenList);
+  recorder?.recordQueryTokens(queryTokenList);
+
+  const queryVector = await embed(query);
+  recorder?.recordEmbedding(queryVector);
+
+  // Over-fetch from each retriever so post-filtering (archive / maxAge /
+  // demoted) doesn't shrink the candidate pool below the user's --limit.
+  const oversample = Math.max(options.limit * 4, options.limit + 5);
+  recorder?.recordVectorRequest({ limit: oversample, oversample, threshold });
+
+  // Vector retrieval. Trace mode re-runs at threshold=0 so every nearest
+  // hit (including those that get rejected) shows up in the debug UI;
+  // the downstream pipeline only sees rows that actually meet `threshold`.
+  let vectorHits = store.vectors.query(queryVector, { limit: oversample, threshold });
+  if (recorder) {
+    const allHits = store.vectors.query(queryVector, { limit: oversample, threshold: 0 });
+    recorder.recordVectorHits(
+      allHits.map((h) => ({
+        id: h.id,
+        text: '',
+        cosine: h.score,
+        distance: 2 * (1 - h.score),
+        passedThreshold: h.score >= threshold,
+      })),
+    );
+    vectorHits = allHits.filter((h) => h.score >= threshold);
+  }
+
+  // FTS5 BM25 retrieval. Union with vector hits so a concept whose
+  // description carries the query word but whose embedding is in a
+  // different cluster still gets a chance at top-K.
+  const ftsHits: FtsHit[] = ftsSearch(store.db, query, { limit: oversample });
+  if (recorder) {
+    recorder.recordFtsHits(ftsHits);
+  }
+  const bm25ById = new Map<string, number>();
+  for (const h of ftsHits) bm25ById.set(h.id, h.bm25);
+
+  // Build the candidate id set as the union of vector hits and FTS hits.
+  // Concepts present in only one retriever still get evaluated; the missing
+  // signal contributes 0 to finalScore.
+  const cosineById = new Map<string, number>();
+  for (const h of vectorHits) cosineById.set(h.id, h.score);
+  const candidateIds: string[] = [];
+  const seenCand = new Set<string>();
+  for (const h of vectorHits) {
+    if (!seenCand.has(h.id)) {
+      seenCand.add(h.id);
+      candidateIds.push(h.id);
+    }
+  }
+  for (const h of ftsHits) {
+    if (!seenCand.has(h.id)) {
+      seenCand.add(h.id);
+      candidateIds.push(h.id);
+    }
+  }
+
+  const conceptMap = bulkConceptsByIds(store.db, candidateIds);
+  const freshnessMap = bulkConceptFreshness(store.db, candidateIds);
+  if (recorder) {
+    const previewIds = idsPreview(candidateIds);
+    recorder.recordGraphQuery({
+      label: 'concepts.byIds',
+      cypher: `SELECT ... FROM concepts WHERE id IN (${candidateIds.length} ids)`,
+      idsPreview: previewIds,
+    });
+    recorder.recordGraphQuery({
+      label: 'freshness.base',
+      cypher: 'SELECT id, archived_at, last_seen_at, access_count FROM concepts WHERE id IN (...)',
+      idsPreview: previewIds,
+    });
+    recorder.recordGraphQuery({
+      label: 'freshness.refs',
+      cypher:
+        'SELECT d.concept_id, MAX(r.published_at) FROM describes d JOIN refs r ON r.url = d.ref_url WHERE d.concept_id IN (...) GROUP BY d.concept_id',
+      idsPreview: previewIds,
+    });
+    recorder.recordGraphQuery({
+      label: 'freshness.deprecates',
+      cypher:
+        "SELECT DISTINCT target_id FROM edges WHERE target_id IN (...) AND edge_type IN ('DEPRECATES','REPLACES')",
+      idsPreview: previewIds,
+    });
+    // Replaces is now collapsed into the deprecates query. Record an empty
+    // entry so PBI-16 tests checking for the label still pass without
+    // forcing a redundant SQL roundtrip.
+    recorder.recordGraphQuery({
+      label: 'freshness.replaces',
+      cypher: '-- merged into freshness.deprecates (single SQL with edge_type IN list)',
+      idsPreview: previewIds,
+    });
+  }
+
+  const partials: PartialCandidate[] = [];
+  const excludedTrace: SearchTraceCandidate[] = [];
+  for (const id of candidateIds) {
+    const cosine = cosineById.get(id) ?? 0;
+    const bm25 = bm25ById.get(id) ?? 0;
+    const concept = conceptMap.get(id);
+    if (!concept) {
+      if (recorder) {
+        excludedTrace.push({
+          id,
+          cosine,
+          freshness: 0,
+          ageDays: null,
+          accessCount: 0,
+          reinforcement: 0,
+          lexical: 0,
+          bm25,
+          demoted: false,
+          archived: false,
+          finalScore: 0,
+          excluded: 'concept-missing',
+        });
+      }
+      continue;
+    }
+    const idTokens = new Set(tokenize(concept.id));
+    const descTokens = new Set(tokenize(concept.description));
+    const detailsTokens = new Set(tokenize(concept.details ?? ''));
+    const lexical = computeLexicalScore(queryTokenSet, idTokens, descTokens, detailsTokens);
+
+    const fresh = freshnessMap.get(id);
+    if (!fresh) {
+      if (recorder) {
+        excludedTrace.push({
+          id,
+          cosine,
+          freshness: 0,
+          ageDays: null,
+          accessCount: 0,
+          reinforcement: 0,
+          lexical,
+          bm25,
+          demoted: false,
+          archived: false,
+          finalScore: 0,
+          excluded: 'concept-missing',
+        });
+      }
+      continue;
+    }
+    const archived = fresh.archivedAt !== null;
+    if (!includeArchived && archived) {
+      if (recorder) {
+        excludedTrace.push({
+          id,
+          cosine,
+          freshness: 0,
+          ageDays: null,
+          accessCount: fresh.accessCount,
+          reinforcement: 0,
+          lexical,
+          bm25,
+          demoted: fresh.isDeprecated,
+          archived: true,
+          finalScore: 0,
+          excluded: 'archived',
+        });
+      }
+      continue;
+    }
+
+    const anchor = parseIso(fresh.newestPublishedAt) ?? parseIso(fresh.lastSeenAt);
+    const age = ageInDays(now, anchor);
+    if (maxAgeDays !== undefined && age > maxAgeDays) {
+      if (recorder) {
+        excludedTrace.push({
+          id,
+          cosine,
+          freshness: freshnessScore(age, halfLifeDays),
+          ageDays: Number.isFinite(age) ? age : null,
+          accessCount: fresh.accessCount,
+          reinforcement: 0,
+          lexical,
+          bm25,
+          demoted: fresh.isDeprecated,
+          archived,
+          finalScore: 0,
+          excluded: 'maxAge',
+        });
+      }
+      continue;
+    }
+    const demoted = fresh.isDeprecated;
+    if (demoteDeprecated === 0 && demoted) {
+      if (recorder) {
+        excludedTrace.push({
+          id,
+          cosine,
+          freshness: freshnessScore(age, halfLifeDays),
+          ageDays: Number.isFinite(age) ? age : null,
+          accessCount: fresh.accessCount,
+          reinforcement: 0,
+          lexical,
+          bm25,
+          demoted: true,
+          archived,
+          finalScore: 0,
+          excluded: 'demoted-zero',
+        });
+      }
+      continue;
+    }
+
+    const freshness = freshnessScore(age, halfLifeDays);
+    partials.push({
+      id: concept.id,
+      description: concept.description,
+      details: concept.details ?? undefined,
+      score: cosine,
+      freshness,
+      ageDays: Number.isFinite(age) ? age : undefined,
+      demoted,
+      accessCount: fresh.accessCount,
+      lexical,
+      bm25,
+      rawCosine: cosine,
+      rawFreshness: freshness,
+      rawAccess: fresh.accessCount,
+      rawLexical: lexical,
+      rawBm25: bm25,
+    });
+  }
+
+  const maxAccess = partials.reduce((m, p) => Math.max(m, p.rawAccess), 0);
+  const accessNorm = maxAccess > 0 ? Math.log1p(maxAccess + 1) : 0;
+
+  const candidates: SearchConceptNode[] = partials.map((p) => {
+    const reinforcement = accessNorm > 0 ? Math.log1p(p.rawAccess) / accessNorm : 0;
+    let final =
+      cosineWeight * p.rawCosine +
+      freshnessWeight * p.rawFreshness +
+      reinforcementWeight * reinforcement +
+      lexicalWeight * p.rawLexical +
+      bm25Weight * p.rawBm25;
+    if (p.demoted) final *= demoteDeprecated;
+    return {
+      id: p.id,
+      description: p.description,
+      details: p.details,
+      score: p.score,
+      freshness: p.freshness,
+      ageDays: p.ageDays,
+      finalScore: final,
+      demoted: p.demoted,
+      accessCount: p.accessCount,
+      reinforcement,
+      lexical: p.rawLexical,
+      bm25: p.rawBm25,
+    };
+  });
+
+  if (recorder) {
+    for (const c of candidates) {
+      recorder.recordCandidate({
+        id: c.id,
+        cosine: c.score ?? 0,
+        freshness: c.freshness ?? 0,
+        ageDays: c.ageDays ?? null,
+        accessCount: c.accessCount ?? 0,
+        reinforcement: c.reinforcement ?? 0,
+        lexical: c.lexical ?? 0,
+        bm25: c.bm25 ?? 0,
+        demoted: c.demoted ?? false,
+        archived: false,
+        finalScore: c.finalScore ?? 0,
+      });
+    }
+    for (const ex of excludedTrace) {
+      recorder.recordCandidate(ex);
+    }
+  }
+
+  candidates.sort((a, b) => (b.finalScore ?? 0) - (a.finalScore ?? 0));
+  const matched = candidates.slice(0, options.limit);
+
+  const matchedIds = matched.map((c) => c.id);
+  const traversal = collectRelatedEdges(store, matchedIds, options.depth, recorder);
+  let relatedIds = [...traversal.reachedIds].filter((id) => !matchedIds.includes(id));
+  if (!includeArchived && relatedIds.length > 0) {
+    if (recorder) {
+      recorder.recordGraphQuery({
+        label: 'related.visible',
+        cypher: 'SELECT id FROM concepts WHERE id IN (...) AND archived_at IS NULL',
+        idsPreview: idsPreview(relatedIds),
+      });
+    }
+    const visible = visibleConceptIds(store.db, relatedIds);
+    relatedIds = relatedIds.filter((id) => visible.has(id));
+  }
+  const relatedConceptMap = bulkConceptsByIds(store.db, relatedIds);
+  if (recorder && relatedIds.length > 0) {
+    recorder.recordGraphQuery({
+      label: 'concepts.related',
+      cypher: 'SELECT ... FROM concepts WHERE id IN (...)',
+      idsPreview: idsPreview(relatedIds),
+    });
+  }
+  const relatedConcepts: SearchConceptNode[] = relatedIds
+    .map((id) => relatedConceptMap.get(id))
+    .filter((c): c is NonNullable<typeof c> => c !== undefined)
+    .map((c) => ({ id: c.id, description: c.description, details: c.details ?? undefined }));
+
+  const allIds = [...matchedIds, ...relatedIds];
+  const references = referencesForConcepts(store.db, allIds);
+  if (recorder && allIds.length > 0) {
+    recorder.recordGraphQuery({
+      label: 'references.byConceptIds',
+      cypher:
+        'SELECT DISTINCT r.url, r.title FROM refs r JOIN describes d ON d.ref_url = r.url WHERE d.concept_id IN (...)',
+      idsPreview: idsPreview(allIds),
+    });
+  }
+
+  if (matchedIds.length > 0 && !options.readOnly) {
+    incrementAccessCounts(store.db, matchedIds);
+  }
+
+  return {
+    query,
+    matchedConcepts: matched,
+    relatedConcepts,
+    references,
+    edges: traversal.edges.map((e) => ({
+      source: e.source,
+      target: e.target,
+      type: e.type,
+      reason: e.reason ?? undefined,
+    })),
+  };
+}
+
+interface CollectEdgesResult {
+  edges: SearchEdge[];
+  reachedIds: Set<string>;
+}
+
+function collectRelatedEdges(
+  store: RefmeshStore,
   rootIds: string[],
   depth: number,
   recorder: SearchTraceRecorder | null,
-): Promise<{ edges: SearchEdge[]; reachedIds: Set<string> }> {
+): CollectEdgesResult {
   const reached = new Set<string>(rootIds);
   const edges: SearchEdge[] = [];
   recorder?.setTraversalDepth(depth);
@@ -548,28 +776,33 @@ async function collectRelatedEdges(
   for (let level = 0; level < depth; level += 1) {
     if (frontier.length === 0) break;
     const frontierSnapshot = [...frontier];
-
-    // |edge_types| queries (parallel) for the entire frontier, instead of
-    // |frontier| × |edge_types| × 2-direction sequential.
-    const batches = await Promise.all(
-      PUBLIC_EDGE_TYPE_NAMES.map((edgeType) =>
-        bulkEdgesForFrontier(conn, edgeType, frontier, recorder, level),
-      ),
-    );
-
     let edgesAddedThisLevel = 0;
     const nextFrontier = new Set<string>();
-    for (const batch of batches) {
-      for (const edge of batch) {
-        edges.push(edge);
+    for (const edgeType of PUBLIC_EDGE_TYPE_NAMES) {
+      const batch = edgesForFrontier(store.db, edgeType, frontier);
+      if (recorder) {
+        recorder.recordGraphQuery({
+          label: `edges.frontier.${edgeType}.level${level}`,
+          cypher:
+            'SELECT source_id, target_id, reason FROM edges WHERE edge_type = ? AND (source_id IN (...) OR target_id IN (...))',
+          idsPreview: idsPreview(frontier),
+        });
+      }
+      for (const e of batch) {
+        edges.push({
+          source: e.source,
+          target: e.target,
+          type: e.type,
+          reason: e.reason ?? undefined,
+        });
         edgesAddedThisLevel += 1;
-        if (!reached.has(edge.target)) {
-          reached.add(edge.target);
-          nextFrontier.add(edge.target);
+        if (!reached.has(e.target)) {
+          reached.add(e.target);
+          nextFrontier.add(e.target);
         }
-        if (!reached.has(edge.source)) {
-          reached.add(edge.source);
-          nextFrontier.add(edge.source);
+        if (!reached.has(e.source)) {
+          reached.add(e.source);
+          nextFrontier.add(e.source);
         }
       }
     }
@@ -589,345 +822,21 @@ async function collectRelatedEdges(
   return { edges: [...dedup.values()], reachedIds: reached };
 }
 
-async function getReferencesForConcepts(
-  conn: KuzuConnection,
-  ids: string[],
-  recorder: SearchTraceRecorder | null,
-): Promise<SearchReferenceNode[]> {
-  if (ids.length === 0) return [];
-  const cypher = `MATCH (r:Reference)-[:${INTERNAL_DESCRIBES_EDGE}]->(c:Concept)
-     WHERE c.id IN ${cypherIdListLiteral(ids)}
-     RETURN r.url AS url, r.title AS title`;
-  recorder?.recordGraphQuery({
-    label: 'references.byConceptIds',
-    cypher,
-    idsPreview: idsPreview(ids),
-  });
-  const rows = await queryAll(conn, cypher);
-  const seen = new Map<string, SearchReferenceNode>();
-  for (const row of rows) {
-    const url = String(row['url']);
-    if (!seen.has(url)) {
-      seen.set(url, { url, title: String(row['title']) });
-    }
-  }
-  return [...seen.values()];
-}
-
-async function executeSearchCore(
-  stores: RefmeshHybridStores,
-  query: string,
-  options: SearchOptions,
-  recorder: SearchTraceRecorder | null,
-): Promise<SearchResult> {
-  validateSearchOptions(options);
-  if (query.length === 0) {
-    throw new RefmeshValidationError('Search query must not be empty.');
-  }
-
-  const threshold = options.threshold ?? DEFAULT_SEARCH_THRESHOLD;
-  const freshnessWeight = options.freshnessWeight ?? 0;
-  const reinforcementWeight = options.reinforcementWeight ?? 0;
-  const lexicalWeight = options.lexicalWeight ?? DEFAULT_LEXICAL_WEIGHT;
-  // Lexical sits alongside cosine inside the cosine half of the budget;
-  // freshness/reinforcement still own their declared share.
-  const cosineWeight = Math.max(0, 1 - freshnessWeight - reinforcementWeight - lexicalWeight);
-  const halfLifeDays = options.halfLifeDays ?? DEFAULT_HALF_LIFE_DAYS;
-  const maxAgeDays = options.maxAgeDays;
-  const demoteDeprecated = options.demoteDeprecated ?? DEFAULT_DEMOTE_DEPRECATED;
-  const includeArchived = options.includeArchived ?? false;
-  const conn = stores.graph.connection;
-  const now = new Date();
-
-  const queryTokenList = tokenize(query);
-  const queryTokenSet: ReadonlySet<string> = new Set(queryTokenList);
-  recorder?.recordQueryTokens(queryTokenList);
-
-  const queryVector = await embed(query);
-  recorder?.recordEmbedding(queryVector);
-
-  // Over-fetch to absorb post-filtering by archive/maxAge/demote, then trim to limit.
-  const oversample = Math.max(options.limit * 4, options.limit + 5);
-  recorder?.recordVectorRequest({ limit: oversample, oversample, threshold });
-
-  // In trace mode, we re-issue the lance query with threshold=0 so the trace
-  // can show every nearest hit (including those that were rejected). The
-  // downstream pipeline still only sees rows that meet the user-supplied
-  // threshold, so non-trace behavior is preserved.
-  let hits: Awaited<ReturnType<typeof stores.vector.queryByVector>>;
-  if (recorder) {
-    const allHits = await stores.vector.queryByVector(queryVector, {
-      limit: oversample,
-      threshold: 0,
-    });
-    recorder.recordVectorHits(
-      allHits.map((h) => ({
-        id: h.id,
-        text: h.text,
-        cosine: h.score,
-        distance: 2 * (1 - h.score),
-        passedThreshold: h.score >= threshold,
-      })),
-    );
-    hits = allHits.filter((h) => h.score >= threshold);
-  } else {
-    hits = await stores.vector.queryByVector(queryVector, {
-      limit: oversample,
-      threshold,
-    });
-  }
-
-  interface PartialCandidate extends SearchConceptNode {
-    rawCosine: number;
-    rawFreshness: number;
-    rawAccess: number;
-    rawLexical: number;
-  }
-  // One bulk fetch + one bulk freshness call covers every vector hit, instead
-  // of N individual round-trips (PBI-13).
-  const hitIds = hits.map((h) => h.id);
-  const [conceptMap, freshnessMap] = await Promise.all([
-    bulkConceptsByIds(conn, hitIds, recorder),
-    bulkConceptFreshness(conn, hitIds, recorder),
-  ]);
-  const partials: PartialCandidate[] = [];
-  // Recorder-only side data so we can report excluded candidates without
-  // double-classifying them.
-  const excludedTrace: SearchTraceCandidate[] = [];
-  for (const hit of hits) {
-    const concept = conceptMap.get(hit.id);
-    if (!concept) {
-      if (recorder) {
-        excludedTrace.push({
-          id: hit.id,
-          cosine: hit.score,
-          freshness: 0,
-          ageDays: null,
-          accessCount: 0,
-          reinforcement: 0,
-          lexical: 0,
-          demoted: false,
-          archived: false,
-          finalScore: 0,
-          excluded: 'concept-missing',
-        });
-      }
-      continue;
-    }
-    // Lexical can be computed as soon as we have the concept; reuse it for
-    // both the partial path and any later exclusion record so debug output
-    // stays consistent.
-    const idTokens = new Set(tokenize(concept.id));
-    const descTokens = new Set(tokenize(concept.description));
-    const detailsTokens = new Set(tokenize(concept.details ?? ''));
-    const lexical = computeLexicalScore(queryTokenSet, idTokens, descTokens, detailsTokens);
-
-    const fresh = freshnessMap.get(hit.id);
-    if (!fresh) {
-      if (recorder) {
-        excludedTrace.push({
-          id: hit.id,
-          cosine: hit.score,
-          freshness: 0,
-          ageDays: null,
-          accessCount: 0,
-          reinforcement: 0,
-          lexical,
-          demoted: false,
-          archived: false,
-          finalScore: 0,
-          excluded: 'concept-missing',
-        });
-      }
-      continue;
-    }
-    const archived = fresh.archivedAt !== null;
-    if (!includeArchived && archived) {
-      if (recorder) {
-        excludedTrace.push({
-          id: hit.id,
-          cosine: hit.score,
-          freshness: 0,
-          ageDays: null,
-          accessCount: fresh.accessCount,
-          reinforcement: 0,
-          lexical,
-          demoted: fresh.isDeprecated,
-          archived: true,
-          finalScore: 0,
-          excluded: 'archived',
-        });
-      }
-      continue;
-    }
-
-    const anchor = fresh.newestPublishedAt ?? fresh.lastSeenAt;
-    const age = ageInDays(now, anchor);
-    if (maxAgeDays !== undefined && age > maxAgeDays) {
-      if (recorder) {
-        excludedTrace.push({
-          id: hit.id,
-          cosine: hit.score,
-          freshness: freshnessScore(age, halfLifeDays),
-          ageDays: Number.isFinite(age) ? age : null,
-          accessCount: fresh.accessCount,
-          reinforcement: 0,
-          lexical,
-          demoted: fresh.isDeprecated,
-          archived,
-          finalScore: 0,
-          excluded: 'maxAge',
-        });
-      }
-      continue;
-    }
-    const demoted = fresh.isDeprecated;
-    if (demoteDeprecated === 0 && demoted) {
-      if (recorder) {
-        excludedTrace.push({
-          id: hit.id,
-          cosine: hit.score,
-          freshness: freshnessScore(age, halfLifeDays),
-          ageDays: Number.isFinite(age) ? age : null,
-          accessCount: fresh.accessCount,
-          reinforcement: 0,
-          lexical,
-          demoted: true,
-          archived,
-          finalScore: 0,
-          excluded: 'demoted-zero',
-        });
-      }
-      continue;
-    }
-
-    const freshness = freshnessScore(age, halfLifeDays);
-    partials.push({
-      ...concept,
-      score: hit.score,
-      freshness,
-      ageDays: Number.isFinite(age) ? age : undefined,
-      demoted,
-      accessCount: fresh.accessCount,
-      lexical,
-      rawCosine: hit.score,
-      rawFreshness: freshness,
-      rawAccess: fresh.accessCount,
-      rawLexical: lexical,
-    });
-  }
-
-  const maxAccess = partials.reduce((m, p) => Math.max(m, p.rawAccess), 0);
-  const accessNorm = maxAccess > 0 ? Math.log1p(maxAccess + 1) : 0; // denominator; avoid divide-by-zero
-
-  const candidates: SearchConceptNode[] = partials.map((p) => {
-    const reinforcement = accessNorm > 0 ? Math.log1p(p.rawAccess) / accessNorm : 0;
-    let final =
-      cosineWeight * p.rawCosine +
-      freshnessWeight * p.rawFreshness +
-      reinforcementWeight * reinforcement +
-      lexicalWeight * p.rawLexical;
-    if (p.demoted) final *= demoteDeprecated;
-    return {
-      id: p.id,
-      description: p.description,
-      details: p.details,
-      score: p.score,
-      freshness: p.freshness,
-      ageDays: p.ageDays,
-      finalScore: final,
-      demoted: p.demoted,
-      accessCount: p.accessCount,
-      reinforcement,
-      lexical: p.rawLexical,
-    };
-  });
-
-  if (recorder) {
-    for (const c of candidates) {
-      recorder.recordCandidate({
-        id: c.id,
-        cosine: c.score ?? 0,
-        freshness: c.freshness ?? 0,
-        ageDays: c.ageDays ?? null,
-        accessCount: c.accessCount ?? 0,
-        reinforcement: c.reinforcement ?? 0,
-        lexical: c.lexical ?? 0,
-        demoted: c.demoted ?? false,
-        archived: false,
-        finalScore: c.finalScore ?? 0,
-      });
-    }
-    for (const ex of excludedTrace) {
-      recorder.recordCandidate(ex);
-    }
-  }
-
-  candidates.sort((a, b) => (b.finalScore ?? 0) - (a.finalScore ?? 0));
-  const matched = candidates.slice(0, options.limit);
-
-  const matchedIds = matched.map((c) => c.id);
-  const { edges, reachedIds } = await collectRelatedEdges(
-    conn,
-    matchedIds,
-    options.depth,
-    recorder,
-  );
-  let relatedIds = [...reachedIds].filter((id) => !matchedIds.includes(id));
-  if (!includeArchived && relatedIds.length > 0) {
-    // We only need the archived bit here, not the full freshness payload —
-    // a single MATCH avoids 4 unrelated queries that bulkConceptFreshness
-    // would have run for newest publishedAt / DEPRECATES / REPLACES.
-    const visibleCypher = `MATCH (c:Concept) WHERE c.id IN ${cypherIdListLiteral(relatedIds)}
-         AND c.archivedAt IS NULL
-       RETURN c.id AS id`;
-    recorder?.recordGraphQuery({
-      label: 'related.visible',
-      cypher: visibleCypher,
-      idsPreview: idsPreview(relatedIds),
-    });
-    const visibleRows = await queryAll(conn, visibleCypher);
-    const visible = new Set(visibleRows.map((r) => String(r['id'] ?? '')));
-    relatedIds = relatedIds.filter((id) => visible.has(id));
-  }
-  const relatedConceptMap = await bulkConceptsByIds(conn, relatedIds, recorder, 'concepts.related');
-  const relatedConcepts: SearchConceptNode[] = relatedIds
-    .map((id) => relatedConceptMap.get(id))
-    .filter((c): c is SearchConceptNode => c !== undefined);
-
-  const allIds = [...matchedIds, ...relatedIds];
-  const references = await getReferencesForConcepts(conn, allIds, recorder);
-
-  if (matchedIds.length > 0 && !options.readOnly) {
-    await incrementAccessCounts(conn, matchedIds);
-  }
-
-  return {
-    query,
-    matchedConcepts: matched,
-    relatedConcepts,
-    references,
-    edges,
-  };
-}
-
 export async function executeSearch(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   query: string,
   options: SearchOptions,
 ): Promise<SearchResult> {
-  return executeSearchCore(stores, query, options, null);
+  return executeSearchCore(store, query, options, null);
 }
 
 export async function executeSearchWithTrace(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   query: string,
   options: SearchOptions,
 ): Promise<{ result: SearchResult; trace: SearchTrace }> {
   const recorder = new SearchTraceRecorder();
-  // Trace mode is observation-only — never bump accessCount even if a caller
-  // forgets to set readOnly. This keeps the debug UI side-effect free.
-  const result = await executeSearchCore(stores, query, { ...options, readOnly: true }, recorder);
+  const result = await executeSearchCore(store, query, { ...options, readOnly: true }, recorder);
   return { result, trace: recorder.build() };
 }
 
@@ -948,6 +857,7 @@ export function renderSearchText(result: SearchResult): string {
     if (c.reinforcement !== undefined && c.reinforcement > 0)
       parts.push(`reinf=${c.reinforcement.toFixed(3)}`);
     if (c.lexical !== undefined && c.lexical > 0) parts.push(`lex=${c.lexical.toFixed(3)}`);
+    if (c.bm25 !== undefined && c.bm25 > 0) parts.push(`bm25=${c.bm25.toFixed(3)}`);
     if (c.accessCount !== undefined && c.accessCount > 0) parts.push(`access=${c.accessCount}`);
     if (c.ageDays !== undefined) parts.push(`age=${c.ageDays.toFixed(1)}d`);
     if (c.finalScore !== undefined) parts.push(`final=${c.finalScore.toFixed(3)}`);
@@ -990,5 +900,4 @@ export function renderSearchJson(result: SearchResult): string {
   return JSON.stringify(result, null, 2);
 }
 
-// Re-exported for external utilities/tests.
 export const _internal = { ALL_EDGE_TYPE_NAMES };

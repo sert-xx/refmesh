@@ -4,7 +4,7 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { dirname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { RefmeshHybridStores } from '../db/connection.js';
+import type { RefmeshStore } from '../db/store.js';
 import { RefmeshRuntimeError, RefmeshValidationError } from '../util/errors.js';
 import {
   getConcept,
@@ -148,17 +148,17 @@ function isLoopbackRequest(req: IncomingMessage): boolean {
 }
 
 export async function handleApiRequest(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   pathname: string,
   search: URLSearchParams,
 ): Promise<{ status: number; body: unknown }> {
   try {
     if (pathname === '/api/stats') {
-      return { status: 200, body: await getStats(stores) };
+      return { status: 200, body: await getStats(store) };
     }
     if (pathname === '/api/concepts') {
       const opts = parseListConceptsOptions(search);
-      return { status: 200, body: await listConcepts(stores, opts) };
+      return { status: 200, body: await listConcepts(store, opts) };
     }
     const conceptMatch = pathname.match(/^\/api\/concepts\/([^/]*)(?:\/(neighbors))?\/?$/);
     if (conceptMatch) {
@@ -171,21 +171,21 @@ export async function handleApiRequest(
       const sub = conceptMatch[2];
       if (sub === 'neighbors') {
         const opts = parseNeighborsOptions(search);
-        const result = await getNeighbors(stores, id, opts);
+        const result = await getNeighbors(store, id, opts);
         if (!result) return { status: 404, body: { error: `concept not found: ${id}` } };
         return { status: 200, body: result };
       }
-      const detail = await getConcept(stores, id);
+      const detail = await getConcept(store, id);
       if (!detail) return { status: 404, body: { error: `concept not found: ${id}` } };
       return { status: 200, body: detail };
     }
     if (pathname === '/api/search') {
       const opts = parseConsoleSearchOptions(search);
-      return { status: 200, body: await runConsoleSearch(stores, opts) };
+      return { status: 200, body: await runConsoleSearch(store, opts) };
     }
     if (pathname === '/api/search/debug') {
       const opts = parseConsoleSearchOptions(search);
-      return { status: 200, body: await runConsoleSearchDebug(stores, opts) };
+      return { status: 200, body: await runConsoleSearchDebug(store, opts) };
     }
     return { status: 404, body: { error: 'unknown api endpoint' } };
   } catch (err) {
@@ -201,7 +201,7 @@ export async function handleApiRequest(
 }
 
 export async function startConsoleServer(
-  stores: RefmeshHybridStores,
+  store: RefmeshStore,
   options: ConsoleServerOptions = {},
 ): Promise<ConsoleServer> {
   const host = options.host ?? '127.0.0.1';
@@ -220,7 +220,7 @@ export async function startConsoleServer(
       }
       const url = new URL(req.url ?? '/', 'http://localhost');
       if (url.pathname.startsWith('/api/')) {
-        const { status, body } = await handleApiRequest(stores, url.pathname, url.searchParams);
+        const { status, body } = await handleApiRequest(store, url.pathname, url.searchParams);
         sendJson(req, res, status, body);
         return;
       }

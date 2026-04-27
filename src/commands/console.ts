@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { type ConsoleServer, startConsoleServer } from '../console/server.js';
-import { openHybridStores } from '../db/connection.js';
+import { openStore } from '../db/store.js';
 import { RefmeshValidationError } from '../util/errors.js';
 import { stderrLogger } from '../util/logger.js';
 
@@ -64,12 +64,12 @@ export interface ConsoleHandle {
 
 export async function executeConsole(opts: ConsoleCommandOptions): Promise<ConsoleHandle> {
   validateConsoleOptions(opts);
-  const stores = await openHybridStores();
+  const store = openStore();
   let server: ConsoleServer;
   try {
-    server = await startConsoleServer(stores, { host: opts.host, port: opts.port });
+    server = await startConsoleServer(store, { host: opts.host, port: opts.port });
   } catch (err) {
-    await stores.close();
+    store.close();
     throw err;
   }
 
@@ -80,7 +80,7 @@ export async function executeConsole(opts: ConsoleCommandOptions): Promise<Conso
     try {
       await server.close();
     } finally {
-      await stores.close();
+      store.close();
     }
   };
 
@@ -97,11 +97,9 @@ export async function runConsoleCommand(opts: ConsoleCommandOptions): Promise<vo
 
   // Graceful shutdown sequence:
   //   1. server.close() drains in-flight requests and stops accepting new ones
-  //   2. handle.shutdown() closes Kùzu and LanceDB
-  //   3. We force-exit with the conventional code for the signal. Letting
-  //      Node terminate naturally caused the Kùzu native destructor to run
-  //      a second time during V8 teardown and segfault (exit 139); calling
-  //      process.exit immediately after the explicit close skips that pass.
+  //   2. handle.shutdown() closes the SQLite handle (statement cache + db)
+  //   3. process.exit short-circuits Node's normal teardown so we don't risk
+  //      replaying any close() side effects.
   await new Promise<never>((_resolve) => {
     let stopping = false;
     const stop = (code: number) => {

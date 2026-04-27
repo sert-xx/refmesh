@@ -5,7 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { executeArchive } from '../src/commands/archive.js';
 import { executeRegister, parseAndValidate } from '../src/commands/register.js';
 import { executeSearchWithTrace } from '../src/commands/search.js';
-import { type RefmeshHybridStores, openHybridStores } from '../src/db/connection.js';
+import { type RefmeshStore, openStore } from '../src/db/store.js';
 import { EMBEDDING_DIMENSION } from '../src/embedding/embedder.js';
 
 function payload(
@@ -22,19 +22,16 @@ function payload(
 
 describe('executeSearchWithTrace', () => {
   let tempDir: string;
-  let stores: RefmeshHybridStores;
+  let store: RefmeshStore;
 
   beforeAll(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'refmesh-trace-'));
-    stores = await openHybridStores({
-      graphPath: join(tempDir, 'graph.kuzu'),
-      vectorPath: join(tempDir, 'vectors.lance'),
-    });
+    store = openStore({ dbPath: join(tempDir, 'refmesh.db') });
   });
 
   afterAll(async () => {
     try {
-      await stores.close();
+      store.close();
     } catch {
       // ignore
     }
@@ -46,18 +43,18 @@ describe('executeSearchWithTrace', () => {
   });
 
   beforeEach(async () => {
-    await stores.graph.connection.query('MATCH (n) DETACH DELETE n');
-    await stores.vector.clearAll();
+    await store.db.exec('DELETE FROM concepts; DELETE FROM refs;');
+    store.vectors.clearAll();
   });
 
   it('captures the query embedding shape', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload('https://example.com/embed', [{ id: 'Alpha', description: 'first concept' }]),
       ),
     );
-    const { trace } = await executeSearchWithTrace(stores, 'first concept', {
+    const { trace } = await executeSearchWithTrace(store, 'first concept', {
       depth: 0,
       limit: 5,
       threshold: 0,
@@ -73,7 +70,7 @@ describe('executeSearchWithTrace', () => {
 
   it('records vectorHits including rejected entries that fall below threshold', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload('https://example.com/threshold', [
           { id: 'CloseMatch', description: 'a wonderful unique sample concept' },
@@ -84,7 +81,7 @@ describe('executeSearchWithTrace', () => {
     );
     // Pin the threshold so the unrelated concepts are returned by lance but
     // rejected by the cosine cut. The trace must still surface them.
-    const { trace } = await executeSearchWithTrace(stores, 'a wonderful unique sample concept', {
+    const { trace } = await executeSearchWithTrace(store, 'a wonderful unique sample concept', {
       depth: 0,
       limit: 5,
       threshold: 0.6,
@@ -111,7 +108,7 @@ describe('executeSearchWithTrace', () => {
 
   it('includes concept / freshness / edge cyphers in graphQueries', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/cypher',
@@ -123,7 +120,7 @@ describe('executeSearchWithTrace', () => {
         ),
       ),
     );
-    const { trace } = await executeSearchWithTrace(stores, 'root', {
+    const { trace } = await executeSearchWithTrace(store, 'root', {
       depth: 1,
       limit: 5,
       threshold: 0,
@@ -139,13 +136,15 @@ describe('executeSearchWithTrace', () => {
     expect(labels.some((l) => l.startsWith('edges.frontier.CONTAINS.level'))).toBe(true);
 
     const conceptsCypher = trace.graphQueries.find((q) => q.label === 'concepts.byIds')?.cypher;
-    expect(conceptsCypher).toContain('MATCH (c:Concept)');
-    expect(conceptsCypher).toContain('RETURN c.id AS id');
+    // The trace now records SQL strings (PBI-18 migration). Labels stay
+    // identical so the rest of the trace UI keeps working; the body just
+    // mentions concepts/SELECT instead of MATCH/Cypher.
+    expect(conceptsCypher).toContain('FROM concepts');
   });
 
   it('reports excluded candidates with their reason', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload('https://example.com/excluded', [
           { id: 'KeepMe', description: 'visible target' },
@@ -153,9 +152,9 @@ describe('executeSearchWithTrace', () => {
         ]),
       ),
     );
-    await executeArchive(stores, 'GoneSoon', { reason: 'old' });
+    await executeArchive(store, 'GoneSoon', { reason: 'old' });
 
-    const { trace } = await executeSearchWithTrace(stores, 'visible target', {
+    const { trace } = await executeSearchWithTrace(store, 'visible target', {
       depth: 0,
       limit: 5,
       threshold: 0,
@@ -175,7 +174,7 @@ describe('executeSearchWithTrace', () => {
 
   it('reports demoted-zero exclusions when demoteDeprecated=0 and a hit is deprecated', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/depr',
@@ -187,7 +186,7 @@ describe('executeSearchWithTrace', () => {
         ),
       ),
     );
-    const { trace } = await executeSearchWithTrace(stores, 'forward-looking item', {
+    const { trace } = await executeSearchWithTrace(store, 'forward-looking item', {
       depth: 0,
       limit: 5,
       threshold: 0,
@@ -203,7 +202,7 @@ describe('executeSearchWithTrace', () => {
     // publishedAt 5 years ago — guaranteed older than 30 days.
     const oldIso = new Date(Date.now() - 1000 * 60 * 60 * 24 * 365 * 5).toISOString();
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         JSON.stringify({
           reference: {
@@ -216,7 +215,7 @@ describe('executeSearchWithTrace', () => {
         }),
       ),
     );
-    const { trace } = await executeSearchWithTrace(stores, 'aging knowledge', {
+    const { trace } = await executeSearchWithTrace(store, 'aging knowledge', {
       depth: 0,
       limit: 5,
       threshold: 0,
@@ -229,7 +228,7 @@ describe('executeSearchWithTrace', () => {
 
   it('produces traversal levels matching the requested depth', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/depth',
@@ -246,7 +245,7 @@ describe('executeSearchWithTrace', () => {
       ),
     );
 
-    const zero = await executeSearchWithTrace(stores, 'origin', {
+    const zero = await executeSearchWithTrace(store, 'origin', {
       depth: 0,
       limit: 5,
       threshold: 0,
@@ -255,7 +254,7 @@ describe('executeSearchWithTrace', () => {
     expect(zero.trace.traversal.depth).toBe(0);
     expect(zero.trace.traversal.levels).toHaveLength(0);
 
-    const two = await executeSearchWithTrace(stores, 'origin', {
+    const two = await executeSearchWithTrace(store, 'origin', {
       depth: 2,
       limit: 5,
       threshold: 0,
@@ -271,22 +270,21 @@ describe('executeSearchWithTrace', () => {
 
   it('does not increment accessCount even when readOnly is left unset', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload('https://example.com/ro-trace', [{ id: 'TraceTarget', description: 'noop side' }]),
       ),
     );
-    await executeSearchWithTrace(stores, 'noop side', {
+    await executeSearchWithTrace(store, 'noop side', {
       depth: 0,
       limit: 5,
       threshold: 0,
       format: 'json',
       // readOnly intentionally omitted; trace must still suppress the write.
     });
-    const after = await stores.graph.connection.query(
-      "MATCH (c:Concept) WHERE c.id = 'TraceTarget' RETURN c.accessCount AS n",
-    );
-    const rows = await after.getAll();
-    expect(Number(rows[0]?.['n'] ?? 0)).toBe(0);
+    const row = store.db
+      .prepare("SELECT access_count AS n FROM concepts WHERE id = 'TraceTarget'")
+      .get() as { n: number } | undefined;
+    expect(row?.n ?? 0).toBe(0);
   });
 });

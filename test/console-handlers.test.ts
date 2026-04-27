@@ -17,7 +17,7 @@ import {
   parseNeighborsOptions,
   runConsoleSearch,
 } from '../src/console/handlers.js';
-import { type RefmeshHybridStores, openHybridStores } from '../src/db/connection.js';
+import { type RefmeshStore, openStore } from '../src/db/store.js';
 import { RefmeshValidationError } from '../src/util/errors.js';
 
 function payload(
@@ -34,19 +34,16 @@ function payload(
 
 describe('console handlers', () => {
   let tempDir: string;
-  let stores: RefmeshHybridStores;
+  let store: RefmeshStore;
 
   beforeAll(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'refmesh-console-'));
-    stores = await openHybridStores({
-      graphPath: join(tempDir, 'graph.kuzu'),
-      vectorPath: join(tempDir, 'vectors.lance'),
-    });
+    store = openStore({ dbPath: join(tempDir, 'refmesh.db') });
   });
 
   afterAll(async () => {
     try {
-      await stores.close();
+      store.close();
     } catch {
       // ignore
     }
@@ -58,8 +55,8 @@ describe('console handlers', () => {
   });
 
   beforeEach(async () => {
-    await stores.graph.connection.query('MATCH (n) DETACH DELETE n');
-    await stores.vector.clearAll();
+    await store.db.exec('DELETE FROM concepts; DELETE FROM refs;');
+    store.vectors.clearAll();
   });
 
   describe('parseListConceptsOptions', () => {
@@ -149,7 +146,7 @@ describe('console handlers', () => {
 
   describe('getStats', () => {
     it('returns zero counts on an empty DB', async () => {
-      const stats = await getStats(stores);
+      const stats = await getStats(store);
       expect(stats.counts.concepts).toBe(0);
       expect(stats.counts.references).toBe(0);
       expect(stats.counts.edgesTotal).toBe(0);
@@ -165,7 +162,7 @@ describe('console handlers', () => {
 
     it('reflects registered concepts, references and edges', async () => {
       await executeRegister(
-        stores,
+        store,
         parseAndValidate(
           payload(
             'https://example.com/stats',
@@ -177,7 +174,7 @@ describe('console handlers', () => {
           ),
         ),
       );
-      const stats = await getStats(stores);
+      const stats = await getStats(store);
       expect(stats.counts.concepts).toBe(2);
       expect(stats.counts.references).toBe(1);
       expect(stats.counts.edgesByType['PART_OF']).toBe(1);
@@ -192,7 +189,7 @@ describe('console handlers', () => {
   describe('listConcepts / getConcept', () => {
     beforeEach(async () => {
       await executeRegister(
-        stores,
+        store,
         parseAndValidate(
           payload(
             'https://example.com/list',
@@ -208,7 +205,7 @@ describe('console handlers', () => {
     });
 
     it('paginates with limit and offset', async () => {
-      const first = await listConcepts(stores, {
+      const first = await listConcepts(store, {
         limit: 2,
         offset: 0,
         includeArchived: false,
@@ -217,7 +214,7 @@ describe('console handlers', () => {
       expect(first.total).toBe(3);
       expect(first.items).toHaveLength(2);
 
-      const second = await listConcepts(stores, {
+      const second = await listConcepts(store, {
         limit: 2,
         offset: 2,
         includeArchived: false,
@@ -229,8 +226,8 @@ describe('console handlers', () => {
     });
 
     it('hides archived items by default and exposes them with includeArchived=true', async () => {
-      await executeArchive(stores, 'Alpha', { reason: 'old' });
-      const visible = await listConcepts(stores, {
+      await executeArchive(store, 'Alpha', { reason: 'old' });
+      const visible = await listConcepts(store, {
         limit: 50,
         offset: 0,
         includeArchived: false,
@@ -239,7 +236,7 @@ describe('console handlers', () => {
       expect(visible.items.find((i) => i.id === 'Alpha')).toBeUndefined();
       expect(visible.total).toBe(2);
 
-      const all = await listConcepts(stores, {
+      const all = await listConcepts(store, {
         limit: 50,
         offset: 0,
         includeArchived: true,
@@ -252,26 +249,26 @@ describe('console handlers', () => {
     });
 
     it('returns concept with references', async () => {
-      const detail = await getConcept(stores, 'Alpha');
+      const detail = await getConcept(store, 'Alpha');
       expect(detail).not.toBeNull();
       expect(detail?.references.length).toBeGreaterThan(0);
       expect(detail?.references[0]?.url).toBe('https://example.com/list');
     });
 
     it('returns null for missing id', async () => {
-      const detail = await getConcept(stores, 'Missing');
+      const detail = await getConcept(store, 'Missing');
       expect(detail).toBeNull();
     });
 
     it('rejects empty id', async () => {
-      await expect(getConcept(stores, '')).rejects.toBeInstanceOf(RefmeshValidationError);
+      await expect(getConcept(store, '')).rejects.toBeInstanceOf(RefmeshValidationError);
     });
   });
 
   describe('getNeighbors', () => {
     beforeEach(async () => {
       await executeRegister(
-        stores,
+        store,
         parseAndValidate(
           payload(
             'https://example.com/n',
@@ -290,14 +287,14 @@ describe('console handlers', () => {
     });
 
     it('returns just the root at depth=0', async () => {
-      const result = await getNeighbors(stores, 'Root', { depth: 0, includeArchived: false });
+      const result = await getNeighbors(store, 'Root', { depth: 0, includeArchived: false });
       expect(result?.nodes).toHaveLength(1);
       expect(result?.edges).toHaveLength(0);
       expect(result?.nodes[0]?.isRoot).toBe(true);
     });
 
     it('expands one level by default', async () => {
-      const result = await getNeighbors(stores, 'Root', { depth: 1, includeArchived: false });
+      const result = await getNeighbors(store, 'Root', { depth: 1, includeArchived: false });
       const ids = result?.nodes.map((n) => n.id) ?? [];
       expect(ids).toContain('Root');
       expect(ids).toContain('Mid');
@@ -306,17 +303,17 @@ describe('console handlers', () => {
     });
 
     it('returns null for missing concept', async () => {
-      const result = await getNeighbors(stores, 'Ghost', { depth: 1, includeArchived: false });
+      const result = await getNeighbors(store, 'Ghost', { depth: 1, includeArchived: false });
       expect(result).toBeNull();
     });
 
     it('hides archived neighbors by default', async () => {
-      await executeArchive(stores, 'Mid');
-      const visible = await getNeighbors(stores, 'Root', { depth: 1, includeArchived: false });
+      await executeArchive(store, 'Mid');
+      const visible = await getNeighbors(store, 'Root', { depth: 1, includeArchived: false });
       const ids = visible?.nodes.map((n) => n.id) ?? [];
       expect(ids).not.toContain('Mid');
 
-      const all = await getNeighbors(stores, 'Root', { depth: 1, includeArchived: true });
+      const all = await getNeighbors(store, 'Root', { depth: 1, includeArchived: true });
       expect(all?.nodes.some((n) => n.id === 'Mid' && n.archived)).toBe(true);
     });
 
@@ -327,7 +324,7 @@ describe('console handlers', () => {
       // injection.
       const trickyIds = ["O'Brien", 'C\\Path', "He said \\'hi\\'"];
       await executeRegister(
-        stores,
+        store,
         parseAndValidate(
           payload(
             'https://example.com/quoted',
@@ -344,7 +341,7 @@ describe('console handlers', () => {
           ),
         ),
       );
-      const result = await getNeighbors(stores, 'QuoteRoot', {
+      const result = await getNeighbors(store, 'QuoteRoot', {
         depth: 1,
         includeArchived: false,
       });
@@ -358,12 +355,12 @@ describe('console handlers', () => {
   describe('runConsoleSearch', () => {
     it('returns a SearchResult shape', async () => {
       await executeRegister(
-        stores,
+        store,
         parseAndValidate(
           payload('https://example.com/s', [{ id: 'Lookup', description: 'find me' }]),
         ),
       );
-      const result = await runConsoleSearch(stores, {
+      const result = await runConsoleSearch(store, {
         query: 'find',
         limit: 5,
         depth: 0,
@@ -379,21 +376,21 @@ describe('console handlers', () => {
       // ranking entirely), runConsoleSearch must behave exactly as if the
       // param was absent.
       await executeRegister(
-        stores,
+        store,
         parseAndValidate(
           payload('https://example.com/legacy', [
             { id: 'LegacyHit', description: 'legacy contract target' },
           ]),
         ),
       );
-      const baseline = await runConsoleSearch(stores, {
+      const baseline = await runConsoleSearch(store, {
         query: 'legacy contract target',
         limit: 5,
         depth: 0,
         threshold: 0,
         includeArchived: false,
       });
-      const withDebugParams = await runConsoleSearch(stores, {
+      const withDebugParams = await runConsoleSearch(store, {
         query: 'legacy contract target',
         limit: 5,
         depth: 0,

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { executeRegister, parseAndValidate } from '../src/commands/register.js';
 import { executeSearch } from '../src/commands/search.js';
-import { type RefmeshHybridStores, openHybridStores } from '../src/db/connection.js';
+import { type RefmeshStore, openStore } from '../src/db/store.js';
 import { RefmeshValidationError } from '../src/util/errors.js';
 
 function payload(
@@ -21,19 +21,16 @@ function payload(
 
 describe('register + search integration', () => {
   let tempDir: string;
-  let stores: RefmeshHybridStores;
+  let store: RefmeshStore;
 
-  beforeAll(async () => {
+  beforeAll(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'refmesh-test-'));
-    stores = await openHybridStores({
-      graphPath: join(tempDir, 'graph.kuzu'),
-      vectorPath: join(tempDir, 'vectors.lance'),
-    });
+    store = openStore({ dbPath: join(tempDir, 'refmesh.db') });
   });
 
-  afterAll(async () => {
+  afterAll(() => {
     try {
-      await stores.close();
+      store.close();
     } catch {
       // ignore
     }
@@ -44,9 +41,11 @@ describe('register + search integration', () => {
     }
   });
 
-  beforeEach(async () => {
-    await stores.graph.connection.query('MATCH (n) DETACH DELETE n');
-    await stores.vector.clearAll();
+  beforeEach(() => {
+    // FK CASCADE flushes describes/edges/concept_vectors as concepts go.
+    // refs is a separate root, so wipe it explicitly.
+    store.db.exec('DELETE FROM concepts; DELETE FROM refs;');
+    store.vectors.clearAll();
   });
 
   it('registers concepts and finds them by keyword', async () => {
@@ -60,11 +59,11 @@ describe('register + search integration', () => {
         [{ source: 'useState', target: 'React Hooks', type: 'PART_OF', reason: 'one of' }],
       ),
     );
-    const summary = await executeRegister(stores, input);
+    const summary = await executeRegister(store, input);
     expect(summary.conceptsUpserted).toBe(2);
     expect(summary.relationshipsByType.PART_OF).toBe(1);
 
-    const result = await executeSearch(stores, 'useState', {
+    const result = await executeSearch(store, 'useState', {
       depth: 1,
       limit: 20,
       format: 'json',
@@ -81,22 +80,22 @@ describe('register + search integration', () => {
 
   it('is idempotent on duplicate register (upsert semantics)', async () => {
     const raw = payload('https://example.com/a', [{ id: 'X', description: 'v1' }], []);
-    await executeRegister(stores, parseAndValidate(raw));
+    await executeRegister(store, parseAndValidate(raw));
     const updatedRaw = payload(
       'https://example.com/a',
       [{ id: 'X', description: 'v2-updated' }],
       [],
     );
-    await executeRegister(stores, parseAndValidate(updatedRaw));
+    await executeRegister(store, parseAndValidate(updatedRaw));
 
-    const result = await executeSearch(stores, 'X', { depth: 0, limit: 20, format: 'json' });
+    const result = await executeSearch(store, 'X', { depth: 0, limit: 20, format: 'json' });
     const hit = result.matchedConcepts.find((c) => c.id === 'X');
     expect(hit?.description).toBe('v2-updated');
   });
 
   it('resolves external references to existing DB nodes', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/existing',
@@ -113,10 +112,10 @@ describe('register + search integration', () => {
         [{ source: 'NewThing', target: 'Existing', type: 'DEPENDS_ON', reason: 'needs it' }],
       ),
     );
-    const summary = await executeRegister(stores, input);
+    const summary = await executeRegister(store, input);
     expect(summary.relationshipsByType.DEPENDS_ON).toBe(1);
 
-    const result = await executeSearch(stores, 'NewThing', {
+    const result = await executeSearch(store, 'NewThing', {
       depth: 1,
       limit: 20,
       format: 'json',
@@ -137,11 +136,11 @@ describe('register + search integration', () => {
         [{ source: 'Solo', target: 'Ghost', type: 'RELATED_TO', reason: 'oops' }],
       ),
     );
-    await expect(executeRegister(stores, input)).rejects.toBeInstanceOf(RefmeshValidationError);
+    await expect(executeRegister(store, input)).rejects.toBeInstanceOf(RefmeshValidationError);
   });
 
   it('returns no results without error when keyword misses', async () => {
-    const result = await executeSearch(stores, 'definitely-not-present', {
+    const result = await executeSearch(store, 'definitely-not-present', {
       depth: 1,
       limit: 20,
       format: 'json',
@@ -152,7 +151,7 @@ describe('register + search integration', () => {
 
   it('respects --depth 0 (no traversal)', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/d',
@@ -164,7 +163,7 @@ describe('register + search integration', () => {
         ),
       ),
     );
-    const result = await executeSearch(stores, 'Root', {
+    const result = await executeSearch(store, 'Root', {
       depth: 0,
       limit: 20,
       format: 'json',
@@ -176,22 +175,22 @@ describe('register + search integration', () => {
 
   it('rejects negative depth', async () => {
     await expect(
-      executeSearch(stores, 'x', { depth: -1, limit: 20, format: 'json' }),
+      executeSearch(store, 'x', { depth: -1, limit: 20, format: 'json' }),
     ).rejects.toBeInstanceOf(RefmeshValidationError);
   });
 
   it('rejects threshold outside [0, 1]', async () => {
     await expect(
-      executeSearch(stores, 'x', { depth: 1, limit: 5, threshold: 1.5, format: 'json' }),
+      executeSearch(store, 'x', { depth: 1, limit: 5, threshold: 1.5, format: 'json' }),
     ).rejects.toBeInstanceOf(RefmeshValidationError);
     await expect(
-      executeSearch(stores, 'x', { depth: 1, limit: 5, threshold: -0.1, format: 'json' }),
+      executeSearch(store, 'x', { depth: 1, limit: 5, threshold: -0.1, format: 'json' }),
     ).rejects.toBeInstanceOf(RefmeshValidationError);
   });
 
   it('applies --limit as vector-search top-K', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/many',
@@ -205,7 +204,7 @@ describe('register + search integration', () => {
         ),
       ),
     );
-    const result = await executeSearch(stores, 'apple banana', {
+    const result = await executeSearch(store, 'apple banana', {
       depth: 0,
       limit: 2,
       threshold: 0.0,
@@ -216,7 +215,7 @@ describe('register + search integration', () => {
 
   it('returns empty matched when threshold is near 1', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/t',
@@ -225,7 +224,7 @@ describe('register + search integration', () => {
         ),
       ),
     );
-    const result = await executeSearch(stores, 'something entirely different', {
+    const result = await executeSearch(store, 'something entirely different', {
       depth: 1,
       limit: 5,
       threshold: 0.999,
@@ -238,7 +237,7 @@ describe('register + search integration', () => {
 
   it('matchedConcepts carry score and are sorted descending', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/score',
@@ -250,7 +249,7 @@ describe('register + search integration', () => {
         ),
       ),
     );
-    const result = await executeSearch(stores, 'React state hook', {
+    const result = await executeSearch(store, 'React state hook', {
       depth: 0,
       limit: 5,
       threshold: 0.0,
@@ -270,7 +269,7 @@ describe('register + search integration', () => {
 
   it('multi-origin BFS deduplicates edges reached from multiple roots', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/multi',
@@ -286,7 +285,7 @@ describe('register + search integration', () => {
         ),
       ),
     );
-    const result = await executeSearch(stores, 'origin', {
+    const result = await executeSearch(store, 'origin', {
       depth: 1,
       limit: 5,
       threshold: 0.0,
@@ -299,7 +298,7 @@ describe('register + search integration', () => {
 
   it('writes one vector row per concept and reflects updated description after re-register', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/v',
@@ -311,20 +310,20 @@ describe('register + search integration', () => {
         ),
       ),
     );
-    expect(await stores.vector.countAll()).toBe(2);
+    expect(store.vectors.countAll()).toBe(2);
 
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload('https://example.com/v', [{ id: 'Alpha', description: 'alpha rewritten' }], []),
       ),
     );
-    expect(await stores.vector.countAll()).toBe(2);
+    expect(store.vectors.countAll()).toBe(2);
   });
 
   it('emits similarWarnings for near-duplicate new concepts', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/sim-base',
@@ -335,7 +334,7 @@ describe('register + search integration', () => {
     );
 
     const summary = await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload(
           'https://example.com/sim-dup',
@@ -360,7 +359,7 @@ describe('register + search integration', () => {
         [{ source: 'SoloX', target: 'PhantomY', type: 'RELATED_TO', reason: 'oops' }],
       ),
     );
-    await expect(executeRegister(stores, input)).rejects.toBeInstanceOf(RefmeshValidationError);
-    expect(await stores.vector.countAll()).toBe(0);
+    await expect(executeRegister(store, input)).rejects.toBeInstanceOf(RefmeshValidationError);
+    expect(store.vectors.countAll()).toBe(0);
   });
 });

@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { executeRegister, parseAndValidate } from '../src/commands/register.js';
 import { type ConsoleServer, startConsoleServer } from '../src/console/server.js';
-import { type RefmeshHybridStores, openHybridStores } from '../src/db/connection.js';
+import { type RefmeshStore, openStore } from '../src/db/store.js';
 
 interface FetchedJson {
   status: number;
@@ -28,21 +28,18 @@ async function fetchJson(url: string, init?: RequestInit): Promise<FetchedJson> 
 
 describe('console HTTP server', () => {
   let tempDir: string;
-  let stores: RefmeshHybridStores;
+  let store: RefmeshStore;
   let server: ConsoleServer;
   let staticDir: string;
 
   beforeAll(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'refmesh-console-srv-'));
-    stores = await openHybridStores({
-      graphPath: join(tempDir, 'graph.kuzu'),
-      vectorPath: join(tempDir, 'vectors.lance'),
-    });
+    store = openStore({ dbPath: join(tempDir, 'refmesh.db') });
     staticDir = join(tempDir, 'static');
     await mkdir(staticDir, { recursive: true });
     writeFileSync(join(staticDir, 'index.html'), '<!doctype html><h1>refmesh</h1>');
     writeFileSync(join(staticDir, 'app.js'), 'console.log("ok");');
-    server = await startConsoleServer(stores, { port: 0, staticRoot: staticDir });
+    server = await startConsoleServer(store, { port: 0, staticRoot: staticDir });
   });
 
   afterAll(async () => {
@@ -52,7 +49,7 @@ describe('console HTTP server', () => {
       // ignore
     }
     try {
-      await stores.close();
+      store.close();
     } catch {
       // ignore
     }
@@ -64,8 +61,8 @@ describe('console HTTP server', () => {
   });
 
   beforeEach(async () => {
-    await stores.graph.connection.query('MATCH (n) DETACH DELETE n');
-    await stores.vector.clearAll();
+    await store.db.exec('DELETE FROM concepts; DELETE FROM refs;');
+    store.vectors.clearAll();
   });
 
   it('binds to a free loopback port and reports a usable URL', () => {
@@ -109,7 +106,7 @@ describe('console HTTP server', () => {
 
   it('exposes registered concepts and their neighbors', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         JSON.stringify({
           reference: { url: 'https://example.com/srv', title: 'srv' },
@@ -163,7 +160,7 @@ describe('console HTTP server', () => {
 
   it('exposes /api/search/debug with a populated trace payload', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         JSON.stringify({
           reference: { url: 'https://example.com/debug', title: 'debug' },
@@ -205,7 +202,7 @@ describe('console HTTP server', () => {
 
   it('does not increment accessCount via /api/search/debug (read-only)', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         JSON.stringify({
           reference: { url: 'https://example.com/ro-debug', title: 'ro-debug' },
@@ -218,11 +215,10 @@ describe('console HTTP server', () => {
       `${server.url}/api/search/debug?q=${encodeURIComponent('read only debug target')}&threshold=0`,
     );
     expect(res.status).toBe(200);
-    const after = await stores.graph.connection.query(
-      "MATCH (c:Concept) WHERE c.id = 'DebugRO' RETURN c.accessCount AS n",
-    );
-    const rows = await after.getAll();
-    expect(Number(rows[0]?.['n'] ?? 0)).toBe(0);
+    const row = store.db
+      .prepare("SELECT access_count AS n FROM concepts WHERE id = 'DebugRO'")
+      .get() as { n: number } | undefined;
+    expect(row?.n ?? 0).toBe(0);
   });
 
   it('refuses symlinks that point outside the static root', async () => {
@@ -246,7 +242,7 @@ describe('console HTTP server', () => {
 
   it('does not increment accessCount when searched via the console API (read-only)', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         JSON.stringify({
           reference: { url: 'https://example.com/ro', title: 'ro' },
@@ -255,21 +251,19 @@ describe('console HTTP server', () => {
         }),
       ),
     );
-    const before = await stores.graph.connection.query(
-      "MATCH (c:Concept) WHERE c.id = 'ReadOnlyTarget' RETURN c.accessCount AS n",
-    );
-    const beforeRows = await before.getAll();
-    expect(Number(beforeRows[0]?.['n'] ?? 0)).toBe(0);
+    const before = store.db
+      .prepare("SELECT access_count AS n FROM concepts WHERE id = 'ReadOnlyTarget'")
+      .get() as { n: number } | undefined;
+    expect(before?.n ?? 0).toBe(0);
 
     const res = await fetchJson(
       `${server.url}/api/search?q=${encodeURIComponent('ReadOnlyTarget')}&threshold=0`,
     );
     expect(res.status).toBe(200);
 
-    const after = await stores.graph.connection.query(
-      "MATCH (c:Concept) WHERE c.id = 'ReadOnlyTarget' RETURN c.accessCount AS n",
-    );
-    const afterRows = await after.getAll();
-    expect(Number(afterRows[0]?.['n'] ?? 0)).toBe(0);
+    const after = store.db
+      .prepare("SELECT access_count AS n FROM concepts WHERE id = 'ReadOnlyTarget'")
+      .get() as { n: number } | undefined;
+    expect(after?.n ?? 0).toBe(0);
   });
 });

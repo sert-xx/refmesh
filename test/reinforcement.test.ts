@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { executeRegister, parseAndValidate } from '../src/commands/register.js';
 import { executeSearch } from '../src/commands/search.js';
-import { type RefmeshHybridStores, openHybridStores } from '../src/db/connection.js';
+import { type RefmeshStore, openStore } from '../src/db/store.js';
 import { RefmeshValidationError } from '../src/util/errors.js';
 
 function payload(refUrl: string, concepts: { id: string; description: string }[]) {
@@ -17,19 +17,16 @@ function payload(refUrl: string, concepts: { id: string; description: string }[]
 
 describe('search reinforcement (PBI-11)', () => {
   let tempDir: string;
-  let stores: RefmeshHybridStores;
+  let store: RefmeshStore;
 
   beforeAll(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'refmesh-reinf-'));
-    stores = await openHybridStores({
-      graphPath: join(tempDir, 'graph.kuzu'),
-      vectorPath: join(tempDir, 'vectors.lance'),
-    });
+    store = openStore({ dbPath: join(tempDir, 'refmesh.db') });
   });
 
   afterAll(async () => {
     try {
-      await stores.close();
+      store.close();
     } catch {
       // ignore
     }
@@ -41,16 +38,16 @@ describe('search reinforcement (PBI-11)', () => {
   });
 
   beforeEach(async () => {
-    await stores.graph.connection.query('MATCH (n) DETACH DELETE n');
-    await stores.vector.clearAll();
+    await store.db.exec('DELETE FROM concepts; DELETE FROM refs;');
+    store.vectors.clearAll();
   });
 
   it('increments accessCount for matched concepts', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(payload('https://example.com/r', [{ id: 'Foo', description: 'a thing' }])),
     );
-    const before = await executeSearch(stores, 'a thing', {
+    const before = await executeSearch(store, 'a thing', {
       depth: 0,
       limit: 5,
       threshold: 0,
@@ -59,7 +56,7 @@ describe('search reinforcement (PBI-11)', () => {
     const accessBefore = before.matchedConcepts.find((c) => c.id === 'Foo')?.accessCount ?? -1;
     expect(accessBefore).toBe(0);
 
-    const after = await executeSearch(stores, 'a thing', {
+    const after = await executeSearch(store, 'a thing', {
       depth: 0,
       limit: 5,
       threshold: 0,
@@ -71,7 +68,7 @@ describe('search reinforcement (PBI-11)', () => {
 
   it('with --reinforcement-weight=1, the concept with higher accessCount ranks first', async () => {
     await executeRegister(
-      stores,
+      store,
       parseAndValidate(
         payload('https://example.com/r2', [
           { id: 'Hot', description: 'identical phrase here' },
@@ -81,7 +78,7 @@ describe('search reinforcement (PBI-11)', () => {
     );
     // Hot を 5 回ヒットさせて accessCount を上げる
     for (let i = 0; i < 5; i += 1) {
-      await executeSearch(stores, 'identical phrase here', {
+      await executeSearch(store, 'identical phrase here', {
         depth: 0,
         limit: 1,
         threshold: 0,
@@ -89,7 +86,7 @@ describe('search reinforcement (PBI-11)', () => {
       });
     }
 
-    const result = await executeSearch(stores, 'identical phrase here', {
+    const result = await executeSearch(store, 'identical phrase here', {
       depth: 0,
       limit: 5,
       threshold: 0,
@@ -102,7 +99,7 @@ describe('search reinforcement (PBI-11)', () => {
 
   it('rejects freshness + reinforcement > 1', async () => {
     await expect(
-      executeSearch(stores, 'q', {
+      executeSearch(store, 'q', {
         depth: 0,
         limit: 5,
         freshnessWeight: 0.6,
@@ -114,7 +111,7 @@ describe('search reinforcement (PBI-11)', () => {
 
   it('rejects out-of-range reinforcement weight', async () => {
     await expect(
-      executeSearch(stores, 'q', {
+      executeSearch(store, 'q', {
         depth: 0,
         limit: 5,
         reinforcementWeight: -0.1,
@@ -122,7 +119,7 @@ describe('search reinforcement (PBI-11)', () => {
       }),
     ).rejects.toBeInstanceOf(RefmeshValidationError);
     await expect(
-      executeSearch(stores, 'q', {
+      executeSearch(store, 'q', {
         depth: 0,
         limit: 5,
         reinforcementWeight: 1.5,
