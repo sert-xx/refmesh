@@ -1,74 +1,76 @@
+**English | [日本語](./README.ja.md)**
+
 # refmesh
 
-自律型コーディングエージェント（Claude Code 等）向けの **ハイブリッド・ナレッジグラフ構築CLI**。
-公式ドキュメントやリファレンスから抽出した「概念（ノード）」と「関係性（エッジ）」を、
-1 ファイルの [SQLite](https://www.sqlite.org/) DB に保存し、
-ベクトル意味検索 + BM25 全文検索 + グラフ探索を同時に行える。
+A **hybrid knowledge-graph CLI** for autonomous coding agents (Claude Code, OpenAI Codex CLI, etc.).
+Extracts "concepts (nodes)" and "relationships (edges)" from official docs and references, stores
+them in a single-file [SQLite](https://www.sqlite.org/) database, and serves
+vector semantic search + BM25 full-text search + graph traversal — all from one process.
 
-- **Storage:** `better-sqlite3` 単一 DB ファイル (`~/.refmesh/refmesh.db`)。`PRAGMA journal_mode=WAL` + 外部キー有効。
-- **Vector index:** インメモリ Float32Array + 正規化済みコサイン類似度（起動時に SQLite から読み出し）。
-- **Full-text:** SQLite **FTS5** (Okapi BM25, 多言語 `unicode61 remove_diacritics 2` トークナイザ)。
-- **Graph traversal:** edges テーブルへの BFS（公開エッジ種別ごとに depth 階層展開）。
-- **Embedding:** `@xenova/transformers` + `Xenova/paraphrase-multilingual-MiniLM-L12-v2`（多言語384次元）。
-  Python 依存なしで Node.js プロセス内でベクトルを生成。
+- **Storage:** `better-sqlite3` single DB file (`~/.refmesh/refmesh.db`), with `PRAGMA journal_mode=WAL` and foreign keys enabled.
+- **Vector index:** In-memory `Float32Array` with normalized cosine similarity, hydrated from SQLite at startup.
+- **Full-text:** SQLite **FTS5** (Okapi BM25) with the multilingual `unicode61 remove_diacritics 2` tokenizer.
+- **Graph traversal:** BFS over the `edges` table, expanded `depth` levels per public edge type.
+- **Embeddings:** `@xenova/transformers` + `Xenova/paraphrase-multilingual-MiniLM-L12-v2` (multilingual, 384-dim).
+  Vectors are generated inside the Node.js process — no Python dependency.
 
-## インストール
+## Installation
 
-### 利用者向け（CLI として使う）
+### For users (use as a CLI)
 
-npm から直接グローバルインストールする:
+Install globally from npm:
 
 ```bash
 npm install -g refmesh
 refmesh --help
-refmesh types          # 動作確認
+refmesh types          # smoke test
 ```
 
 > [!IMPORTANT]
-> **既存ユーザーへの注意 (PBI-18 で SQLite に統合):** 旧バージョン (Kùzu + LanceDB) のローカル DB (`~/.refmesh/graph.kuzu` および `~/.refmesh/vectors.lance`) との互換性はありません。アップグレード後は両ディレクトリを削除し、`refmesh register` で再投入してください。新 DB は `~/.refmesh/refmesh.db` 1 ファイルにまとまります。
+> **Note for existing users (storage unified to SQLite in PBI-18):** Older versions used Kùzu + LanceDB at `~/.refmesh/graph.kuzu` and `~/.refmesh/vectors.lance`. There is **no compatibility** with that data — after upgrading, delete both directories and re-run `refmesh register`. The new database lives in a single file at `~/.refmesh/refmesh.db`.
 >
-> `better-sqlite3` はネイティブビルドが必要ですが、メジャー OS / Node.js バージョン向けにプリビルトが配布されているため通常は `npm install` だけで完了します。
+> `better-sqlite3` requires a native build, but prebuilt binaries are published for major OS / Node.js combinations, so plain `npm install` usually works without a toolchain.
 >
-> 初回 `refmesh search` 実行時に Hugging Face Hub から多言語埋め込みモデル（約 80 MB）を `~/.refmesh/models/` に取得する。以降はオフライン動作。
+> On the first `refmesh search`, the multilingual embedding model (~80 MB) is downloaded from the Hugging Face Hub to `~/.refmesh/models/`. After that, refmesh runs offline.
 >
-> **書き込み権限が制限された環境（Codex 等のサンドボックス CLI）から refmesh を呼び出す場合**、当該環境では `~/.refmesh/models/` への書き込みに失敗してモデル読み込みが詰まる。事前に書き込み権限のあるユーザで `refmesh prefetch` を実行してモデルを配置しておけば、以降の `refmesh search` / `register` は読み取りのみで動作する。配置先を変更したい場合は環境変数 `REFMESH_MODEL_DIR` で上書きできる（事前 DL とランタイムの双方で同じ値を渡すこと）。
+> **When invoking refmesh from a sandboxed CLI with restricted write access (e.g., Codex CLI),** writes to `~/.refmesh/models/` will fail and the model loader will hang. Pre-populate the cache with `refmesh prefetch` from a user that *can* write — subsequent `refmesh search` / `register` will then run read-only against the cache. Override the location with the `REFMESH_MODEL_DIR` environment variable (pass the same value at prefetch time and at runtime).
 
-### 開発者向け（このリポジトリで作業する）
+### For developers (working in this repo)
 
 ```bash
-mise install      # mise.toml にピンされた Node.js 22 (arm64) を取得
+mise install      # fetch the Node.js 22 (arm64) version pinned in mise.toml
 npm install
 npm run build
-npm run dev -- types          # tsx で直接実行
-# あるいはローカルビルドをグローバルに公開
+npm run dev -- types          # run directly via tsx
+# or expose your local build globally
 npm link && refmesh --help
 ```
 
-## 使い方
+## Usage
 
-### 1. スキーマとエッジ種別を取得
+### 1. Inspect the schema and edge types
 
 ```bash
 refmesh types
-# または機械可読な JSON で
+# or as machine-readable JSON
 refmesh types --format json
 ```
 
-### 2. 知識を登録
+### 2. Register knowledge
 
-JSON をパイプで流す:
+Pipe JSON in:
 
 ```bash
 cat knowledge.json | refmesh register
 ```
 
-もしくはファイルパスを指定:
+Or pass a file path:
 
 ```bash
 refmesh register -f knowledge.json
 ```
 
-登録対象 JSON の例（`publishedAt` / `fetchedAt` は optional だが、鮮度スコアリングを使うなら強く推奨）:
+Example payload (`publishedAt` / `fetchedAt` are optional, but strongly recommended if you plan to use freshness scoring):
 
 ```json
 {
@@ -81,187 +83,189 @@ refmesh register -f knowledge.json
   "concepts": [
     {
       "id": "useState",
-      "description": "コンポーネントに状態変数を追加するためのHook",
+      "description": "A Hook that lets you add a state variable to a component.",
       "details": "const [state, setState] = useState(initialState);"
     },
-    { "id": "React Hooks", "description": "Reactの状態管理やライフサイクル機能へのフック群" }
+    { "id": "React Hooks", "description": "Built-in hooks for React state and lifecycle features." }
   ],
   "relationships": [
     {
       "source": "useState",
       "target": "React Hooks",
       "type": "PART_OF",
-      "reason": "useStateはReactが提供する標準Hookの一つであるため"
+      "reason": "useState is one of the standard hooks shipped by React."
     }
   ]
 }
 ```
 
-`register` を再実行すると、Concept の `lastSeenAt` 更新と `touchCount += 1` が自動で行われる（`firstSeenAt` は不変）。
+Re-running `register` updates the concept's `lastSeenAt` and increments `touchCount` automatically (`firstSeenAt` is preserved).
 
-### 3. 検索
+### 3. Search
 
-検索クエリは自然言語でOK。ベクトル化されてコンセプト集合から起点が選ばれ、`--depth` だけグラフを辿った知識の束を返す。
+Queries are natural language. They are embedded, used to pick seed concepts, then expanded `--depth` levels through the graph to return a related cluster of knowledge.
 
 ```bash
-refmesh search "Reactでの安全な状態管理"                      # 自然言語クエリで意味検索 → depth=1 で関連取得
-refmesh search "React Hooks" --depth 2 --limit 10            # 2階層まで辿る、ベクトル候補を最大10件
-refmesh search "useState" --threshold 0.7 --format json      # 類似度 0.7 以上のみ、JSON 出力
+refmesh search "Safe state management in React"           # natural-language query → semantic search → depth=1 expansion
+refmesh search "React Hooks" --depth 2 --limit 10         # walk 2 hops, take up to 10 vector candidates
+refmesh search "useState" --threshold 0.7 --format json   # only similarity ≥ 0.7, JSON output
 ```
 
-オプション:
+Options:
 
-- `--depth <n>`: グラフ探索の深さ（デフォルト: 1）
-- `--limit <n>`: ベクトル検索で取得する候補ノードの最大数（デフォルト: 5）
-- `--threshold <value>`: 類似度の最小しきい値 [0, 1]（デフォルト: 0.3）
-- `--freshness-weight <0..1>`: 鮮度の重み（デフォルト: 0 = 鮮度を考慮しない）
-- `--half-life <days>`: 鮮度の半減期（デフォルト: 180）
-- `--max-age <days>`: ここより古いノードは結果から除外（デフォルト: 制限なし）
-- `--demote-deprecated <0..1>`: `DEPRECATES` / `REPLACES` のターゲットに掛ける倍率（デフォルト: 0.5、0 で除外）
-- `--reinforcement-weight <0..1>`: アクセス回数による強化の重み（デフォルト: 0、freshness + reinforcement ≤ 1）
-- `--lexical-weight <0..1>`: クエリ語と id/description/details のトークン一致による語彙ブースト（デフォルト: 0.3、cosine と独立した加点軸）
-- `--bm25-weight <0..1>`: SQLite FTS5 (BM25) による全文検索ブースト（デフォルト: 0.3、cosine と独立した加点軸）
-- `--include-archived`: アーカイブ済みノードも結果に含める
-- `--format <text|json>`: 出力形式（デフォルト: text）
+- `--depth <n>`: graph traversal depth (default: `1`)
+- `--limit <n>`: maximum number of seed candidates from vector search (default: `5`)
+- `--threshold <value>`: minimum similarity threshold, `[0, 1]` (default: `0.3`)
+- `--freshness-weight <0..1>`: weight of freshness in the final score (default: `0` — freshness ignored)
+- `--half-life <days>`: freshness half-life (default: `180`)
+- `--max-age <days>`: drop nodes older than this from results (default: unlimited)
+- `--demote-deprecated <0..1>`: multiplier applied to targets of `DEPRECATES` / `REPLACES` (default: `0.5`; use `0` to exclude)
+- `--reinforcement-weight <0..1>`: weight of access-count reinforcement (default: `0`; freshness + reinforcement ≤ 1)
+- `--lexical-weight <0..1>`: lexical boost from token overlap against `id` / `description` / `details` (default: `0.3`; independent of cosine)
+- `--bm25-weight <0..1>`: full-text boost from SQLite FTS5 / BM25 (default: `0.3`; independent of cosine)
+- `--include-archived`: include archived nodes in results
+- `--format <text|json>`: output format (default: `text`)
 
-最終スコアは `final = max(0, 1 - w_f - w_r - w_l - w_b) · cosine + w_f · freshness + w_r · reinforcement + w_l · lexical + w_b · bm25`（`demoted` のときは更に `demoteDeprecated` 倍）。
-候補集合はベクトル top-K と FTS5 top-K の **和集合** で取り、両方の score を Concept 単位でマージしてから再ランクするので、片方の retriever にしかヒットしない概念も拾えます。
-`freshness = exp(-ln2 · age / halfLife)` で、`age` は `Reference.publishedAt` の最新値（無ければ `Concept.lastSeenAt`）から算出。
+The final score is `final = max(0, 1 − w_f − w_r − w_l − w_b) · cosine + w_f · freshness + w_r · reinforcement + w_l · lexical + w_b · bm25` (multiplied additionally by `demoteDeprecated` when the candidate is `demoted`).
+The candidate set is the **union** of vector top-K and FTS5 top-K, merged per concept and re-ranked, so concepts that only one retriever surfaces are still picked up.
+`freshness = exp(−ln2 · age / halfLife)`, where `age` is computed from the latest `Reference.publishedAt` (falling back to `Concept.lastSeenAt`).
 
-#### 登録時の重複検知
+#### Duplicate detection at registration
 
-`register` は新規 Concept の embedding を既存 Vector Store と照合し、類似度 ≥ 0.95 の既存ノードがあれば
-サマリに `⚠ Similar existing concepts` として警告する。エージェントはこれを受けて、新規ノード作成を止めて
-既存 id を再利用するか、`SAME_AS` エッジで接続するか判断する。
+`register` compares each new concept's embedding against the existing vector index. If any existing node has similarity ≥ 0.95, the run prints `⚠ Similar existing concepts` in the summary. Agents should treat this as a signal to stop creating a new node and instead reuse the existing id, or connect the two with a `SAME_AS` edge.
 
-### 4. グラフDBの状態をブラウザで確認（console）
+### 4. Inspect the graph in the browser (`refmesh console`)
 
-`refmesh console` でローカル Web ダッシュボードを起動し、ブラウザでグラフを視覚的に点検できる。
-**読み取り専用**で、ループバック (`127.0.0.1`) のみ受け付ける。Python 依存はゼロ。
+`refmesh console` starts a local web dashboard so you can visually inspect the graph. It is **read-only** and accepts loopback (`127.0.0.1`) connections only. There are no Python dependencies.
 
 ```bash
-refmesh console                # 空きポートに自動バインドし、既定ブラウザで開く
-refmesh console --port 8765    # ポートを固定
-refmesh console --no-open      # ブラウザを開かず URL だけ表示
+refmesh console                # bind to a free port and open the default browser
+refmesh console --port 8765    # pin a port
+refmesh console --no-open      # just print the URL, don't launch a browser
 ```
 
-ダッシュボードのタブ構成:
+Dashboard tabs:
 
-- **Overview**: Concept / Reference / Edge 件数、Edge type 別の分布、Kùzu / LanceDB のパスとサイズ。
-- **Concepts**: 一覧 + ページング + ソート (lastSeenAt / touchCount / id)。`archived` も任意で表示。
-- **Search**: 自然言語クエリで `refmesh search` 相当のスコアリング検索を実行。
-- **Search Debug**: 検索パイプラインを段階別に可視化。クエリ埋め込みの形状 (dim / L2ノルム / 全次元プレビュー)、LanceDB に投げた `oversample` と `threshold` 前の全ベクトルヒット (棄却分含む)、Kùzu に発行された Cypher 一覧、各候補のスコア内訳 (cosine / freshness / reinforcement / final と除外理由)、近傍展開の各 level のフロンティア・追加 edge 数を表示する。`accessCount` を更新しない読み取り専用。
-- **Graph**: 起点 Concept を指定するとグラフを描画。**ノードクリックで近傍を増分展開**でき、Edge type ごとに色分けされる。
+- **Overview**: counts of Concepts / References / Edges, edge-type distribution, plus the SQLite DB path, file size, and vector row count.
+- **Concepts**: paginated list with sorting (`lastSeenAt` / `touchCount` / `id`); archived rows can be toggled in.
+- **Search**: run the same scored search as `refmesh search` against natural-language queries.
+- **Search Debug**: stage-by-stage view of the search pipeline — query embedding shape (dim / L2 norm / full-vector preview), the `oversample` / `threshold` settings sent to the vector index along with **all** vector hits before threshold filtering (including rejected ones), the SQL queries issued to the graph during traversal, the per-candidate score breakdown (`cosine` / `freshness` / `reinforcement` / `lexical` / `bm25` / `final` and any exclusion reason), and per-level frontier and added-edge counts. Read-only — does not bump `accessCount`.
+- **Graph**: pick a seed concept and render the graph. **Click a node to expand its neighborhood incrementally**; edges are color-coded by edge type.
 
-`Ctrl+C` で停止し、Kùzu / LanceDB のコネクションをクリーンに閉じる。
+`Ctrl+C` stops the server and cleanly closes the SQLite handle (statement cache + db).
 
-### 5. 古い知識の整理（archive / prune）
+### 5. Curate stale knowledge (archive / prune)
 
 ```bash
-# 論理アーカイブ（検索から除外、復活可能）
+# Logical archive — excluded from search, recoverable
 refmesh archive OldUseState --reason "replaced by hooks"
 refmesh unarchive OldUseState
 
-# 物理削除（dry-run がデフォルト）
+# Physical delete — dry-run by default
 refmesh prune --older-than 365 --max-touches 1
 refmesh prune --older-than 365 --max-touches 1 --apply
 ```
 
-`prune` は `lastSeenAt` が cutoff より古く `touchCount <= --max-touches` のノードを Graph と Vector の両方から削除する。
-デフォルトで archived は対象外（`--include-archived` で含める）。`--apply` を付けない限り変更は加わらない。
+`prune` deletes concepts whose `lastSeenAt` is older than the cutoff and whose `touchCount` is `<= --max-touches`, removing them from both the concept tables and the vector index.
+By default archived concepts are excluded; pass `--include-archived` to include them. Nothing is changed unless `--apply` is given.
 
-## エージェントから自動運用する（スキル同梱）
+## Driving refmesh from agents (bundled skills)
 
-`example/skills/` に **Claude Code と OpenAI Codex CLI 両対応**のスキルを 3 つ同梱している。
-シーン別にトリガーが分かれており、フォルダごと `~/.claude/skills/` または `~/.codex/skills/` にコピーするだけで利用できる。
+`example/skills/` ships three skills that work for **both Claude Code and OpenAI Codex CLI**.
+Each is triggered by a different scenario; copy the folder into `~/.claude/skills/` or `~/.codex/skills/` to start using them.
 
-| スキル | 起動シーン | 中身 |
+| Skill | Trigger | What it does |
 |---|---|---|
-| `refmesh-register` | 「この URL を分析して知識を蓄えて」「remember this doc」 | URL を fetch → 概念抽出 → 既存グラフを `refmesh search` で discovery → 既存ノードに edge で接続して `refmesh register` |
-| `refmesh-search` | タスク開始時、固有名詞・目的が登場した瞬間 | 自然言語クエリで意味検索 + マルチ起点 BFS。鮮度・demote・reinforcement 等の状況別フラグ表を提供 |
-| `refmesh-curate` | `⚠ Similar existing concepts` 警告、世代交代、古い情報の整理 | SAME_AS マージ / REPLACES / DEPRECATES / archive / prune の判断ツリー |
+| `refmesh-register` | "Analyze this URL and remember it", "remember this doc" | Fetch URL → extract concepts → discover existing graph via `refmesh search` → connect to existing nodes with edges and call `refmesh register` |
+| `refmesh-search` | At task start, the moment a proper noun or goal appears | Natural-language semantic search + multi-seed BFS, with a situational flag table for freshness / demote / reinforcement |
+| `refmesh-curate` | On a `⚠ Similar existing concepts` warning, generational handoff, stale-knowledge cleanup | Decision tree for `SAME_AS` merge / `REPLACES` / `DEPRECATES` / archive / prune |
 
-各スキルは `SKILL.md`（Claude / Codex 共通）と `agents/openai.yaml`（Codex の UI メタデータ）の組み合わせ。
+Each skill is a `SKILL.md` (shared by Claude and Codex) plus `agents/openai.yaml` (Codex UI metadata).
 
-### 取り込み方法
+### Installation
 
 ```bash
-# Claude Code（プロジェクト固有）
+# Claude Code (project-scoped)
 mkdir -p .claude/skills && cp -r example/skills/refmesh-* .claude/skills/
 
-# Claude Code（ユーザー全体）
+# Claude Code (user-wide)
 mkdir -p ~/.claude/skills && cp -r example/skills/refmesh-* ~/.claude/skills/
 
 # OpenAI Codex CLI
 mkdir -p ~/.codex/skills && cp -r example/skills/refmesh-* ~/.codex/skills/
 ```
 
-取り込み後、エージェントに「この URL を読んで知識を蓄えて」「先ほど登録した React Hooks について教えて」のように話しかけると、`description` のトリガーキーワードに反応して該当スキルが呼び出され、内部で `refmesh` CLI が実行される。
+Once installed, prompts like "Read this URL and remember it" or "Tell me about the React Hooks I just registered" will match the skill's `description` triggers and invoke the corresponding skill, which in turn calls the `refmesh` CLI.
 
-## データ格納先
+## Storage paths
 
-- DB (SQLite) デフォルト: `~/.refmesh/refmesh.db` / 上書き: `REFMESH_DB_PATH`
-- 埋め込みモデルキャッシュ デフォルト: `~/.refmesh/models/` / 上書き: `REFMESH_MODEL_DIR`
+- DB (SQLite) — default: `~/.refmesh/refmesh.db` / override: `REFMESH_DB_PATH`
+- Embedding model cache — default: `~/.refmesh/models/` / override: `REFMESH_MODEL_DIR`
 
-埋め込みモデルキャッシュは初回 `refmesh search` / `register` 実行時に自動で作られるが、
-`refmesh prefetch` で明示的に事前 DL することもできる（権限制限された実行環境向け）。
-
-```bash
-refmesh prefetch                      # ~/.refmesh/models/ に配置（既配置ならスキップ）
-refmesh prefetch --format json        # 機械可読出力
-REFMESH_MODEL_DIR=/opt/refmesh/models refmesh prefetch   # 配置先を上書き
-```
-
-## エッジ種別
-
-15種類の公開エッジ種別を提供する（`refmesh types` で一覧を取得可能）。
-カテゴリ: 構造・分類 / 依存・実装 / データフロー / 比較・関連 / 同一性解決 / ライフサイクル。
-
-同一性解決カテゴリの `SAME_AS` は、表記揺れ等で別ノードになっている2つの Concept を「同一概念」として接続する。
-`DESCRIBES` エッジは Reference → Concept の紐づけ専用として CLI が自動で張るため、利用者側で直接扱うことはない。
-
-## 開発
+The embedding model cache is created automatically on the first `refmesh search` / `register`,
+or can be populated explicitly via `refmesh prefetch` (useful for permission-restricted runtimes):
 
 ```bash
-npm run typecheck   # 型チェック
-npm run lint        # biome で静的解析
-npm run format      # biome でフォーマット
-npm test            # vitest でテスト実行
-npm run build       # dist/ にコンパイル
+refmesh prefetch                      # populate ~/.refmesh/models/ (skipped if already present)
+refmesh prefetch --format json        # machine-readable output
+REFMESH_MODEL_DIR=/opt/refmesh/models refmesh prefetch   # override the cache location
 ```
 
-## アーキテクチャ
+## Edge types
+
+15 public edge types are exposed (list them with `refmesh types`).
+Categories: structural / dependency / data flow / comparison / identity resolution / lifecycle.
+
+`SAME_AS` (identity-resolution) connects two concepts that ended up as separate nodes due to naming variation but really refer to the same thing.
+`DESCRIBES` is reserved for the CLI's own `Reference → Concept` linking and is never written by users directly.
+
+## Development
+
+```bash
+npm run typecheck   # type checking
+npm run lint        # static analysis with biome
+npm run format      # format with biome
+npm test            # run tests with vitest
+npm run build       # compile to dist/
+```
+
+## Architecture
 
 ```
 src/
-├── cli.ts                 # エントリポイント (commander)
-├── index.ts               # ライブラリとしてのエクスポート
+├── cli.ts                 # entry point (commander)
+├── index.ts               # library exports
 ├── commands/
 │   ├── types.ts           # refmesh types
-│   ├── register.ts        # refmesh register (Graph + Vector 同期 + メタデータ更新)
-│   ├── search.ts          # refmesh search (cosine × freshness × reinforcement の合成スコア)
+│   ├── register.ts        # refmesh register (synchronized Concept + Vector + FTS updates)
+│   ├── search.ts          # refmesh search (composite cosine + freshness + reinforcement + lexical + bm25 score)
 │   ├── archive.ts         # refmesh archive / unarchive / prune
-│   ├── console.ts         # refmesh console (ローカル Web ダッシュボード)
-│   └── prefetch.ts        # refmesh prefetch (埋め込みモデルの事前 DL / 配置)
+│   ├── console.ts         # refmesh console (local web dashboard)
+│   └── prefetch.ts        # refmesh prefetch (embedding model pre-download / placement)
 ├── console/
-│   ├── handlers.ts        # 読み取り専用 API (stats / concepts / neighbors / search)
-│   └── server.ts          # loopback 限定の HTTP サーバ + 静的アセット配信
+│   ├── handlers.ts        # read-only API (stats / concepts / neighbors / search / search-debug)
+│   ├── server.ts          # loopback-only HTTP server + static asset serving
+│   └── index.ts
 ├── db/
-│   ├── connection.ts      # Kùzu + LanceDB のハイブリッド接続層
-│   ├── schema.ts          # ノード/エッジテーブル DDL
-│   ├── vector-store.ts    # LanceDB ラッパ (upsert/query/delete/clear)
-│   └── paths.ts           # DB パス解決
+│   ├── store.ts           # SQLite connection layer (better-sqlite3 + statement cache + WAL)
+│   ├── migrations.ts      # schema DDL and migrations
+│   ├── concept-repo.ts    # CRUD for Concept / Reference / Edge
+│   ├── graph.ts           # BFS / frontier expansion over the edges table
+│   ├── fts.ts             # FTS5 virtual table build + queries
+│   ├── vector-index.ts    # in-memory Float32Array vector index
+│   ├── statement-cache.ts # prepared-statement cache
+│   └── paths.ts           # DB path resolution (~/.refmesh/refmesh.db, REFMESH_DB_PATH)
 ├── embedding/
-│   ├── embedder.ts        # @xenova/transformers で埋め込み生成 / prefetchEmbeddingModel()
-│   └── paths.ts           # モデルキャッシュパス解決 (~/.refmesh/models/, REFMESH_MODEL_DIR)
+│   ├── embedder.ts        # embedding generation via @xenova/transformers / prefetchEmbeddingModel()
+│   └── paths.ts           # model cache path resolution (~/.refmesh/models/, REFMESH_MODEL_DIR)
 ├── schema/
-│   ├── edge-types.ts      # エッジ Enum と説明 (単一ソース)
-│   └── register-schema.ts # JSON Schema (Ajv 用)
+│   ├── edge-types.ts      # edge enum + descriptions (single source of truth)
+│   └── register-schema.ts # JSON Schema (for Ajv)
 └── util/
     ├── errors.ts
     └── logger.ts
 ```
 
-## ライセンス
+## License
 
 MIT
