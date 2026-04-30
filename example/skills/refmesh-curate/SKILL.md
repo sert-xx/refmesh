@@ -72,6 +72,17 @@ When two concepts denote the same idea (`useState` and `UseStateHook`, `Postgres
 
 `SAME_AS` is bidirectional in meaning but unidirectional in the graph. Convention: `SAME_AS` from the *non-canonical* to the *canonical* node, so traversals from a search hit to canonical knowledge are one hop.
 
+### Special case: namespace-shadowed duplicates
+
+If you find both a bare-named concept and a vendor / product-prefixed concept that mean the same thing — typically `Hooks` ↔ `Claude Code Hooks`, `Skills` ↔ `Claude Code Skills`, `Built-in Tools` ↔ `Claude Agent SDK Built-in Tools` — the bare form is the **non-canonical** one (see the `refmesh-register` namespacing rule). Always:
+
+1. Re-register full description / details / relationships on the **prefixed** id.
+2. Add `SAME_AS` from the bare id → prefixed id (not the other way).
+3. Migrate any incoming relationships you care about to the prefixed id (re-register the source concept with the corrected target).
+4. Archive the bare id once nothing depends on it.
+
+Do **not** attempt this merge across ecosystems: `Claude Code Hooks` and `Claude Agent SDK Hooks` are *different concepts*. They share `INTEGRATES_WITH` or `RELATED_TO`, never `SAME_AS`.
+
 ---
 
 ## Move 2 — Mark version transitions (REPLACES / DEPRECATES)
@@ -183,4 +194,5 @@ You do not need to curate every session. Reasonable rhythm:
 - **Don't `--apply` prune without reading the dry-run output.** Deletes are irreversible; archive first if you're unsure.
 - **Don't archive a concept that is still the target of active relationships.** Either remove the relationships first, or use REPLACES/DEPRECATES to mark it as outdated while keeping it visible.
 - **Don't create a SAME_AS chain (A SAME_AS B SAME_AS C).** Always point to the single canonical id.
+- **Don't merge across ecosystems with SAME_AS.** `Claude Code Hooks` and `Claude Agent SDK Hooks` (or `Codex Hooks`, etc.) are deliberately separate concepts — collapsing them defeats the namespacing rule. Use `INTEGRATES_WITH` or `RELATED_TO` if a connection exists.
 - **Don't substitute curate for register.** If the source has *new* information, register first; curate is for relationships between things that already exist.

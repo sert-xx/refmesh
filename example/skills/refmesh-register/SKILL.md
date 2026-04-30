@@ -48,10 +48,26 @@ Read back the `edgeTypes` array and the `registerInputSchema`. **Never invent ed
    - If a source genuinely *is* the artifact worth remembering (e.g. a specific RFC that is itself referenced by name like "RFC 7519"), the canonical id is the artifact's name (`RFC 7519`, `JWT`), not a meta-label like "RFC 7519 specification document".
 2. **Descriptions state facts about the subject, not about the source.** Write `description` as if defining the concept in a glossary. Avoid phrases like "This document describes…", "The article explains…", "This page covers…" — they are signals you are describing the source instead of the subject.
 3. **Canonical ids.** Use the official, public name as `Concept.id` (`useState`, not `useStateHook` or `the useState hook`). This makes future agents reach the same node.
-4. **One sentence description, code in details.** `description` is what the embedder sees most strongly — keep it specific and self-contained. Put runnable snippets, signatures, or long quotes in `details`.
-5. **Build a mesh, not a list.** Every concept must connect to at least one other concept via a relationship if such a connection exists in the source. Isolated nodes are nearly useless to retrieve.
-6. **Reuse existing nodes (see "Connect to existing knowledge" below).** Always probe the graph before inventing a new id; reuse the canonical one whenever it already exists.
-7. **Date the source.** Set `reference.publishedAt` to the document's published date if known (ISO 8601). This unlocks freshness scoring later.
+4. **Namespace ambiguous names with the owning vendor / product.** When the canonical name of a concept could plausibly exist in multiple ecosystems — `Hooks`, `Skills`, `Sub-agents`, `Slash Commands`, `Agent Tool`, `settings.json`, `Routines` — prefix the id with the owning vendor / product (`Claude Code Hooks`, not bare `Hooks`; `Claude Agent SDK Built-in Tools`, not bare `Built-in Tools`). This keeps a future ecosystem (Codex, Cursor, etc.) from colliding with the existing ones. Skip the prefix when **any** of the following holds:
+   - The canonical name already contains the owning vendor / product (`Claude Agent SDK`, `CLAUDE.md`, `Claude Code Desktop App`).
+   - The id is a fully-qualified file path or package identifier that is unambiguous on its own (`~/.claude/settings.json`, `.mcp.json`, `SKILL.md`, `@anthropic-ai/claude-agent-sdk`).
+   - The concept is a cross-ecosystem standard owned by a separate body (`MCP`, `OAuth 2.0`, `HTTP Transport`, `JWT`, `RFC 7519`).
+   - The id is itself a vendor name or third-party product (`Anthropic API`, `Amazon Bedrock`, `Google Vertex AI`, `useState`).
+
+   | Bare canonical | Prefix needed? | Final id |
+   |---|---|---|
+   | `Hooks` (Claude Code feature) | yes | `Claude Code Hooks` |
+   | `/init` (slash command) | yes | `Claude Code /init` |
+   | `Built-in Tools` (Agent SDK) | yes | `Claude Agent SDK Built-in Tools` |
+   | `useState` (React) | no — 3rd-party canonical | `useState` |
+   | `MCP` | no — cross-ecosystem standard | `MCP` |
+   | `.mcp.json` | no — file path | `.mcp.json` |
+   | `Anthropic API` | no — vendor name | `Anthropic API` |
+
+5. **One sentence description, code in details.** `description` is what the embedder sees most strongly — keep it specific and self-contained. Put runnable snippets, signatures, or long quotes in `details`.
+6. **Build a mesh, not a list.** Every concept must connect to at least one other concept via a relationship if such a connection exists in the source. Isolated nodes are nearly useless to retrieve.
+7. **Reuse existing nodes (see "Connect to existing knowledge" below).** Always probe the graph before inventing a new id; reuse the canonical one whenever it already exists.
+8. **Date the source.** Set `reference.publishedAt` to the document's published date if known (ISO 8601). This unlocks freshness scoring later.
 
 ## Connect to existing knowledge
 
@@ -155,6 +171,7 @@ Brand-new concepts are useful, but the real value of refmesh is the **edges** be
 ## Common mistakes
 
 - **Registering the document itself as a concept.** Symptoms: a `Concept.id` like `"useEffect docs"` / `"the React tutorial"`, or a `description` starting with "This document…", "This page explains…", "The article covers…". The source is captured by `reference`; `concepts[]` must hold the *subjects discussed in* the source. Future searches like `refmesh search "useEffect"` will not match a node whose description is about a documentation page.
+- **Registering an ecosystem-specific feature with a bare generic id (`Hooks`, `Skills`, `Agent Tool`, `Routines`).** When the same name could plausibly belong to a different ecosystem in the future, prefix it (`Claude Code Hooks`, `Claude Agent SDK Built-in Tools`); see [Authoring rule 4](#authoring-rules). If you find a bare-id duplicate after the fact, hand off to `refmesh-curate`.
 - **Inventing edge types.** Anything outside the 15 public types fails validation with exit 2.
 - **Empty `relationships`.** If the source actually contains relationships, registering an island of disconnected concepts wastes registration budget.
 - **Skipping the discovery loop.** Failing to probe with `refmesh search` before authoring the payload causes duplicates and orphan islands. The graph stays a list instead of a mesh.
