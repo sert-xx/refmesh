@@ -1,0 +1,4 @@
+interface:
+  display_name: "Refmesh Investigation Orchestrator"
+  short_description: "An orchestrator skill that governs simple investigations with a refmesh-first approach"
+  default_prompt: "Use $refmesh-investigation-orchestrator to start this investigation with refmesh-search, and proceed to include refmesh-register if necessary."
